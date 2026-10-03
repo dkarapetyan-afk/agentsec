@@ -1,0 +1,7 @@
+/target
+*.enc
+*.key
+*.sock
+daemon.json
+token
+.env*
