@@ -24,7 +24,23 @@ has_tmux_session() {
     tmux has-session -t "$SESSION_NAME" 2>/dev/null
 }
 
+rotate_log_if_needed() {
+    local max_bytes=10485760 # 10MB limit
+    if [ -f "$LOG_FILE" ]; then
+        local current_size
+        current_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+        if [ "$current_size" -ge "$max_bytes" ]; then
+            mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null || true
+            touch "$LOG_FILE" 2>/dev/null || true
+            chmod 664 "$LOG_FILE" 2>/dev/null || true
+            log "Notice: Rotated ${LOG_FILE} because size exceeded 10MB threshold."
+        fi
+    fi
+}
+
 main() {
+    rotate_log_if_needed
+
     local healthy=0
     local in_tmux=0
 

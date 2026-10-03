@@ -1,0 +1,10 @@
+/var/log/agentsec-watchdog.log {
+    rotate 4
+    size 10M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    create 0664 terry terry
+}
