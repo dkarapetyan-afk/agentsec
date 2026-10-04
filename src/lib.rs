@@ -8,3 +8,4 @@ pub mod scanner;
 pub mod secret;
 pub mod server;
 pub mod store;
+pub mod token;

@@ -1,10 +1,11 @@
 use crate::config::AppConfig;
 use crate::secret::SecretMetadata;
 use crate::server::{
-    DeleteNamespaceResponse, DeleteSecretResponse, ErrorResponse, ExportNamespaceResponse,
-    HealthResponse, NamespacesResponse, SecretDetailResponse, SecretsListResponse,
-    SetSecretRequest, StatusResponse,
+    CreateTokenRequest, DeleteNamespaceResponse, DeleteSecretResponse, ErrorResponse,
+    ExportNamespaceResponse, HealthResponse, NamespacesResponse, RevokeTokenResponse,
+    SecretDetailResponse, SecretsListResponse, SetSecretRequest, StatusResponse, TokenListResponse,
 };
+use crate::token::ClientToken;
 use anyhow::{anyhow, Context, Result};
 use reqwest::{Client, StatusCode};
 use std::collections::HashMap;
@@ -300,6 +301,83 @@ impl DaemonClient {
 
         let body: ExportNamespaceResponse = resp.json().await?;
         Ok(body.secrets)
+    }
+
+    pub async fn list_client_tokens(&self) -> Result<Vec<ClientToken>> {
+        let url = format!("{}/v1/tokens", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.auth_token)
+            .send()
+            .await
+            .map_err(|e| self.check_connection_error(e))?;
+
+        if !resp.status().is_success() {
+            let err_body: ErrorResponse = resp.json().await.unwrap_or(ErrorResponse {
+                error: "Unknown server error".into(),
+            });
+            return Err(anyhow!("Server error: {}", err_body.error));
+        }
+
+        let body: TokenListResponse = resp.json().await?;
+        Ok(body.tokens)
+    }
+
+    pub async fn create_client_token(
+        &self,
+        name: &str,
+        description: Option<String>,
+        ttl_seconds: Option<u64>,
+        namespaces: Vec<String>,
+    ) -> Result<ClientToken> {
+        let url = format!("{}/v1/tokens", self.base_url);
+        let req = CreateTokenRequest {
+            name: name.to_string(),
+            description,
+            ttl_seconds,
+            namespaces,
+        };
+
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.auth_token)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| self.check_connection_error(e))?;
+
+        if !resp.status().is_success() {
+            let err_body: ErrorResponse = resp.json().await.unwrap_or(ErrorResponse {
+                error: "Unknown server error".into(),
+            });
+            return Err(anyhow!("Failed to create token: {}", err_body.error));
+        }
+
+        let token: ClientToken = resp.json().await?;
+        Ok(token)
+    }
+
+    pub async fn revoke_client_token(&self, name: &str) -> Result<bool> {
+        let url = format!("{}/v1/tokens/{}", self.base_url, urlencoding(name));
+        let resp = self
+            .client
+            .delete(&url)
+            .bearer_auth(&self.auth_token)
+            .send()
+            .await
+            .map_err(|e| self.check_connection_error(e))?;
+
+        if !resp.status().is_success() {
+            let err_body: ErrorResponse = resp.json().await.unwrap_or(ErrorResponse {
+                error: "Unknown server error".into(),
+            });
+            return Err(anyhow!("Failed to revoke token: {}", err_body.error));
+        }
+
+        let body: RevokeTokenResponse = resp.json().await?;
+        Ok(body.revoked)
     }
 }
 

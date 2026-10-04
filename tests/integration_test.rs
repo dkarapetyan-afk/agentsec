@@ -290,3 +290,135 @@ async fn test_external_vs_local_authentication_and_tunnel_url() {
     server_handle.abort();
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[tokio::test]
+async fn test_named_client_tokens_lifecycle_and_scoping() {
+    let test_id = rand::random::<u64>();
+    let temp_dir = env::temp_dir().join(format!("agentsec_token_test_{}", test_id));
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let port = 56000 + (test_id % 3000) as u16;
+    let config = AppConfig::load(Some(temp_dir.clone()), Some(port)).unwrap();
+    let master_token = config.get_or_create_auth_token().unwrap();
+    let master_key = MasterKey::generate();
+    let vault = Vault::new(master_key, Some(config.vault_path.clone())).unwrap();
+
+    // Spawn server
+    let server_config = config.clone();
+    let server_vault = vault.clone();
+    let server_token = master_token.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = start_server(server_config, server_vault, server_token).await;
+    });
+
+    sleep(Duration::from_millis(150)).await;
+
+    let master_client = DaemonClient::new(&config).expect("Master client init failed");
+
+    // 1. Populate secrets in two separate namespaces
+    let ns_a = "repo:service-a";
+    let ns_b = "repo:service-b";
+
+    master_client
+        .set_secret(ns_a, "KEY_A", "secret-value-a", None, vec![], None)
+        .await
+        .unwrap();
+
+    master_client
+        .set_secret(ns_b, "KEY_B", "secret-value-b", None, vec![], None)
+        .await
+        .unwrap();
+
+    // 2. Create named tokens:
+    // a) scoped token restricted to ns_a
+    let scoped_token_meta = master_client
+        .create_client_token("scoped-agent", Some("Restricted agent".into()), None, vec![ns_a.to_string()])
+        .await
+        .expect("Failed to create scoped token");
+    assert_eq!(scoped_token_meta.name, "scoped-agent");
+    assert_eq!(scoped_token_meta.namespaces, vec![ns_a.to_string()]);
+    let raw_scoped_token = scoped_token_meta.token.clone();
+
+    // b) unrestricted token
+    let global_token_meta = master_client
+        .create_client_token("global-agent", Some("Unrestricted agent".into()), None, vec![])
+        .await
+        .expect("Failed to create global token");
+    assert_eq!(global_token_meta.name, "global-agent");
+    assert!(global_token_meta.namespaces.is_empty());
+    let raw_global_token = global_token_meta.token.clone();
+
+    // c) short-lived token (1 second TTL)
+    let expiring_token_meta = master_client
+        .create_client_token("ephemeral-agent", None, Some(1), vec![])
+        .await
+        .expect("Failed to create expiring token");
+    let raw_expiring_token = expiring_token_meta.token.clone();
+
+    // 3. Test list_client_tokens
+    let token_list = master_client.list_client_tokens().await.unwrap();
+    assert_eq!(token_list.len(), 3);
+    assert!(token_list.iter().any(|t| t.name == "scoped-agent"));
+    assert!(token_list.iter().any(|t| t.name == "global-agent"));
+    assert!(token_list.iter().any(|t| t.name == "ephemeral-agent"));
+
+    // 4. Test scoped token authorization
+    let scoped_config = AppConfig::load_with_overrides(
+        Some(temp_dir.clone()),
+        Some(port),
+        Some(format!("http://127.0.0.1:{}", port)),
+        Some(raw_scoped_token.clone()),
+    )
+    .unwrap();
+    let scoped_client = DaemonClient::new(&scoped_config).unwrap();
+
+    // Scoped client CAN read ns_a
+    let detail_a = scoped_client.get_secret(ns_a, "KEY_A").await;
+    assert!(detail_a.is_ok(), "Scoped client should have access to ns_a");
+    assert_eq!(detail_a.unwrap().value, "secret-value-a");
+
+    // Scoped client CANNOT read ns_b (should get 401 Unauthorized)
+    let detail_b = scoped_client.get_secret(ns_b, "KEY_B").await;
+    assert!(detail_b.is_err(), "Scoped client must be denied access to ns_b");
+
+    // 5. Test global token authorization
+    let global_config = AppConfig::load_with_overrides(
+        Some(temp_dir.clone()),
+        Some(port),
+        Some(format!("http://127.0.0.1:{}", port)),
+        Some(raw_global_token.clone()),
+    )
+    .unwrap();
+    let global_client = DaemonClient::new(&global_config).unwrap();
+
+    assert!(global_client.get_secret(ns_a, "KEY_A").await.is_ok());
+    assert!(global_client.get_secret(ns_b, "KEY_B").await.is_ok());
+
+    // 6. Test expiring token after 1.5 seconds
+    sleep(Duration::from_millis(1500)).await;
+    let expiring_config = AppConfig::load_with_overrides(
+        Some(temp_dir.clone()),
+        Some(port),
+        Some(format!("http://127.0.0.1:{}", port)),
+        Some(raw_expiring_token),
+    )
+    .unwrap();
+    let expiring_client = DaemonClient::new(&expiring_config).unwrap();
+    let expired_resp = expiring_client.get_secret(ns_a, "KEY_A").await;
+    assert!(expired_resp.is_err(), "Expired token must be rejected");
+
+    // 7. Revoke scoped token and verify it immediately stops working
+    let revoked = master_client.revoke_client_token("scoped-agent").await.unwrap();
+    assert!(revoked);
+
+    let revoked_resp = scoped_client.get_secret(ns_a, "KEY_A").await;
+    assert!(revoked_resp.is_err(), "Revoked token must be rejected");
+
+    // 8. Master token still works perfectly
+    let master_check = master_client.get_secret(ns_a, "KEY_A").await;
+    assert!(master_check.is_ok());
+
+    server_handle.abort();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+

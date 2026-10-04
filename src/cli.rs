@@ -179,8 +179,62 @@ pub struct RunArgs {
 
 #[derive(Args, Debug)]
 pub struct TokenArgs {
-    #[arg(long, help = "Generate and replace the current authentication token")]
+    #[command(subcommand)]
+    pub action: Option<TokenAction>,
+
+    #[arg(long, help = "Generate and replace the current master authentication token")]
     pub rotate: bool,
+
+    #[arg(long, help = "Create a new named token for a client or agent")]
+    pub create: Option<String>,
+
+    #[arg(long, help = "List all active named client tokens")]
+    pub list: bool,
+
+    #[arg(long, help = "Revoke a named client token by name")]
+    pub revoke: Option<String>,
+
+    #[arg(long, help = "Optional human-readable description for the named token")]
+    pub description: Option<String>,
+
+    #[arg(long, help = "Optional time-to-live in seconds for the named token")]
+    pub ttl: Option<u64>,
+
+    #[arg(short, long, help = "Restrict named token to specific namespace(s)")]
+    pub namespace: Vec<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TokenAction {
+    #[command(about = "Create a new named token for a client or agent")]
+    Create(CreateTokenArgs),
+
+    #[command(about = "List all active named client tokens")]
+    List,
+
+    #[command(about = "Revoke a named client token by name")]
+    Revoke(RevokeTokenArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct CreateTokenArgs {
+    #[arg(help = "The unique name for this client token (e.g. agent-laptop, ci-runner)")]
+    pub name: String,
+
+    #[arg(short, long, help = "Optional description for this client token")]
+    pub description: Option<String>,
+
+    #[arg(long, help = "Optional time-to-live in seconds before this token expires")]
+    pub ttl: Option<u64>,
+
+    #[arg(short, long, help = "Restrict token access to specific namespace(s) (can be passed multiple times)")]
+    pub namespace: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct RevokeTokenArgs {
+    #[arg(help = "The name of the client token to revoke")]
+    pub name: String,
 }
 
 #[derive(Args, Debug)]

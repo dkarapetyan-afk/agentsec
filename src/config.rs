@@ -32,6 +32,7 @@ pub struct AppConfig {
     pub socket_path: PathBuf,
     pub daemon_info_path: PathBuf,
     pub tunnel_url_path: PathBuf,
+    pub client_tokens_path: PathBuf,
     pub port: u16,
     pub host: String,
     pub custom_url: Option<String>,
@@ -82,6 +83,7 @@ impl AppConfig {
         let socket_path = data_dir.join("daemon.sock");
         let daemon_info_path = data_dir.join("daemon.json");
         let tunnel_url_path = config_dir.join("tunnel.url");
+        let client_tokens_path = config_dir.join("tokens.json");
 
         let port = custom_port
             .or_else(|| {
@@ -109,11 +111,17 @@ impl AppConfig {
             socket_path,
             daemon_info_path,
             tunnel_url_path,
+            client_tokens_path,
             port,
             host,
             custom_url: url,
             custom_token: token_override,
         })
+    }
+
+    /// Load or create the named client tokens store
+    pub fn load_client_tokens(&self) -> Result<crate::token::ClientTokenStore> {
+        crate::token::ClientTokenStore::load_or_create(self.client_tokens_path.clone())
     }
 
     /// Retrieve or generate the persistent API authentication token

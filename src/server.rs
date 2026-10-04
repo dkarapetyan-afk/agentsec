@@ -1,6 +1,7 @@
 use crate::config::{AppConfig, DaemonInfo};
 use crate::secret::SecretMetadata;
 use crate::store::{Vault, VaultStats};
+use crate::token::{ClientToken, ClientTokenStore};
 use anyhow::{Context, Result};
 use axum::{
     extract::{Path, State},
@@ -15,6 +16,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::signal;
+use tokio::sync::RwLock;
 use tracing::{error, info};
 
 #[derive(Clone)]
@@ -22,6 +24,7 @@ pub struct ServerState {
     pub vault: Vault,
     pub auth_token: String,
     pub external_token: Option<String>,
+    pub client_tokens: Arc<RwLock<ClientTokenStore>>,
     pub started_at: DateTime<Utc>,
     pub port: u16,
     pub host: String,
@@ -96,6 +99,26 @@ pub struct ExportNamespaceResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateTokenRequest {
+    pub name: String,
+    pub description: Option<String>,
+    pub ttl_seconds: Option<u64>,
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenListResponse {
+    pub tokens: Vec<ClientToken>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokeTokenResponse {
+    pub revoked: bool,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
 }
@@ -117,6 +140,8 @@ pub fn create_router(state: ServerState) -> Router {
                 .delete(delete_secret_handler),
         )
         .route("/v1/export/:namespace", get(export_namespace_handler))
+        .route("/v1/tokens", get(list_tokens_handler).post(create_token_handler))
+        .route("/v1/tokens/:name", delete(revoke_token_handler))
         .with_state(Arc::new(state))
 }
 
@@ -145,6 +170,8 @@ fn verify_auth(
     headers: &HeaderMap,
     expected_token: &str,
     external_token: Option<&str>,
+    client_tokens: &ClientTokenStore,
+    target_namespace: Option<&str>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let token_candidate = headers
         .get(AUTHORIZATION)
@@ -154,19 +181,25 @@ fn verify_auth(
 
     match token_candidate {
         Some(token) => {
-            let matches_primary = token == expected_token;
-            let matches_external = external_token.map_or(false, |ext| token == ext);
-
-            if matches_primary || matches_external {
-                Ok(())
-            } else {
-                Err((
-                    StatusCode::UNAUTHORIZED,
-                    Json(ErrorResponse {
-                        error: "Invalid authentication token".to_string(),
-                    }),
-                ))
+            // 1. Primary master token: unrestricted
+            if token == expected_token {
+                return Ok(());
             }
+            // 2. External token: unrestricted
+            if external_token.map_or(false, |ext| token == ext) {
+                return Ok(());
+            }
+            // 3. Named client tokens: validate expiry and namespace restriction
+            if client_tokens.validate(token, target_namespace) {
+                return Ok(());
+            }
+
+            Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "Invalid or unauthorized authentication token".to_string(),
+                }),
+            ))
         }
         None => Err((
             StatusCode::UNAUTHORIZED,
@@ -184,7 +217,8 @@ async fn health_handler(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     if is_external_request(&headers) {
-        verify_auth(&headers, &state.auth_token, state.external_token.as_deref())?;
+        let tokens = state.client_tokens.read().await;
+        verify_auth(&headers, &state.auth_token, state.external_token.as_deref(), &tokens, None)?;
     }
 
     Ok(Json(HealthResponse {
@@ -197,7 +231,10 @@ async fn status_handler(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    verify_auth(&headers, &state.auth_token, state.external_token.as_deref())?;
+    {
+        let tokens = state.client_tokens.read().await;
+        verify_auth(&headers, &state.auth_token, state.external_token.as_deref(), &tokens, None)?;
+    }
 
     let now = Utc::now();
     let uptime = (now - state.started_at).num_seconds();
@@ -228,7 +265,10 @@ async fn list_namespaces_handler(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    verify_auth(&headers, &state.auth_token, state.external_token.as_deref())?;
+    {
+        let tokens = state.client_tokens.read().await;
+        verify_auth(&headers, &state.auth_token, state.external_token.as_deref(), &tokens, None)?;
+    }
 
     let namespaces = state.vault.list_namespaces();
     Ok(Json(NamespacesResponse { namespaces }))
@@ -239,7 +279,10 @@ async fn delete_namespace_handler(
     headers: HeaderMap,
     Path(namespace): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    verify_auth(&headers, &state.auth_token, state.external_token.as_deref())?;
+    {
+        let tokens = state.client_tokens.read().await;
+        verify_auth(&headers, &state.auth_token, state.external_token.as_deref(), &tokens, Some(&namespace))?;
+    }
 
     match state.vault.delete_namespace(&namespace) {
         Ok(count) => Ok(Json(DeleteNamespaceResponse {
@@ -260,7 +303,10 @@ async fn list_secrets_handler(
     headers: HeaderMap,
     Path(namespace): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    verify_auth(&headers, &state.auth_token, state.external_token.as_deref())?;
+    {
+        let tokens = state.client_tokens.read().await;
+        verify_auth(&headers, &state.auth_token, state.external_token.as_deref(), &tokens, Some(&namespace))?;
+    }
 
     let secrets = state.vault.list_secrets(&namespace);
     let count = secrets.len();
@@ -276,7 +322,10 @@ async fn get_secret_handler(
     headers: HeaderMap,
     Path((namespace, key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    verify_auth(&headers, &state.auth_token, state.external_token.as_deref())?;
+    {
+        let tokens = state.client_tokens.read().await;
+        verify_auth(&headers, &state.auth_token, state.external_token.as_deref(), &tokens, Some(&namespace))?;
+    }
 
     match state.vault.get(&namespace, &key) {
         Some(entry) => Ok(Json(SecretDetailResponse {
@@ -300,7 +349,10 @@ async fn set_secret_handler(
     Path((namespace, key)): Path<(String, String)>,
     Json(payload): Json<SetSecretRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    verify_auth(&headers, &state.auth_token, state.external_token.as_deref())?;
+    {
+        let tokens = state.client_tokens.read().await;
+        verify_auth(&headers, &state.auth_token, state.external_token.as_deref(), &tokens, Some(&namespace))?;
+    }
 
     if payload.value.trim().is_empty() {
         return Err((
@@ -334,7 +386,10 @@ async fn delete_secret_handler(
     headers: HeaderMap,
     Path((namespace, key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    verify_auth(&headers, &state.auth_token, state.external_token.as_deref())?;
+    {
+        let tokens = state.client_tokens.read().await;
+        verify_auth(&headers, &state.auth_token, state.external_token.as_deref(), &tokens, Some(&namespace))?;
+    }
 
     match state.vault.delete(&namespace, &key) {
         Ok(deleted) => Ok(Json(DeleteSecretResponse {
@@ -356,13 +411,73 @@ async fn export_namespace_handler(
     headers: HeaderMap,
     Path(namespace): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    verify_auth(&headers, &state.auth_token, state.external_token.as_deref())?;
+    {
+        let tokens = state.client_tokens.read().await;
+        verify_auth(&headers, &state.auth_token, state.external_token.as_deref(), &tokens, Some(&namespace))?;
+    }
 
     let secrets = state.vault.export_namespace(&namespace);
     Ok(Json(ExportNamespaceResponse {
         namespace,
         secrets,
     }))
+}
+
+// Token management handlers
+
+async fn list_tokens_handler(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let tokens = state.client_tokens.read().await;
+    verify_auth(&headers, &state.auth_token, state.external_token.as_deref(), &tokens, None)?;
+
+    let list = tokens.list();
+    Ok(Json(TokenListResponse { tokens: list }))
+}
+
+async fn create_token_handler(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateTokenRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    {
+        let tokens = state.client_tokens.read().await;
+        verify_auth(&headers, &state.auth_token, state.external_token.as_deref(), &tokens, None)?;
+    }
+
+    let mut tokens = state.client_tokens.write().await;
+    match tokens.add(&payload.name, payload.description, payload.ttl_seconds, payload.namespaces) {
+        Ok(created) => Ok((StatusCode::CREATED, Json(created))),
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Failed to create token: {}", e),
+            }),
+        )),
+    }
+}
+
+async fn revoke_token_handler(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    {
+        let tokens = state.client_tokens.read().await;
+        verify_auth(&headers, &state.auth_token, state.external_token.as_deref(), &tokens, None)?;
+    }
+
+    let mut tokens = state.client_tokens.write().await;
+    match tokens.revoke(&name) {
+        Ok(revoked) => Ok(Json(RevokeTokenResponse { revoked, name })),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to revoke token: {}", e),
+            }),
+        )),
+    }
 }
 
 /// Run the background HTTP daemon server with graceful shutdown handling
@@ -377,10 +492,14 @@ pub async fn start_server(config: AppConfig, vault: Vault, auth_token: String) -
         .ok()
         .filter(|s| !s.trim().is_empty());
 
+    let client_tokens = config.load_client_tokens()?;
+    let client_tokens = Arc::new(RwLock::new(client_tokens));
+
     let state = ServerState {
         vault,
         auth_token,
         external_token,
+        client_tokens,
         started_at,
         port: config.port,
         host: config.host.clone(),

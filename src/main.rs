@@ -1,4 +1,4 @@
-use agentsec::cli::{Cli, Commands};
+use agentsec::cli::{Cli, Commands, TokenAction};
 use agentsec::client::DaemonClient;
 use agentsec::config::{detect_workspace_namespace, AppConfig};
 use agentsec::crypto::get_or_create_master_key;
@@ -310,15 +310,119 @@ async fn main() -> Result<()> {
         }
 
         Commands::Token(args) => {
-            if args.rotate {
-                let _ = std::fs::remove_file(&config.token_path);
-                let new_token = config.get_or_create_auth_token()?;
-                println!("🔑 Rotated API Auth Token:");
-                println!("{}", new_token);
+            let action = if let Some(act) = args.action {
+                Some(act)
+            } else if let Some(name) = args.create {
+                Some(TokenAction::Create(agentsec::cli::CreateTokenArgs {
+                    name,
+                    description: args.description,
+                    ttl: args.ttl,
+                    namespace: args.namespace,
+                }))
+            } else if args.list {
+                Some(TokenAction::List)
+            } else if let Some(name) = args.revoke {
+                Some(TokenAction::Revoke(agentsec::cli::RevokeTokenArgs { name }))
             } else {
-                let token = config.get_or_create_auth_token()?;
-                println!("🔑 Active Daemon API Auth Token:");
-                println!("{}", token);
+                None
+            };
+
+            match action {
+                Some(TokenAction::Create(create_args)) => {
+                    let client = DaemonClient::new(&config)?;
+                    match client
+                        .create_client_token(
+                            &create_args.name,
+                            create_args.description,
+                            create_args.ttl,
+                            create_args.namespace,
+                        )
+                        .await
+                    {
+                        Ok(token) => {
+                            println!("🔑 Created Client Token '{}':", token.name);
+                            println!("   Token:          {}", token.token);
+                            println!("   Masked Preview: {}", token.masked_preview);
+                            if let Some(desc) = &token.description {
+                                println!("   Description:    {}", desc);
+                            }
+                            if token.namespaces.is_empty() {
+                                println!("   Namespaces:     * (All namespaces)");
+                            } else {
+                                println!("   Namespaces:     {}", token.namespaces.join(", "));
+                            }
+                            let exp_str = match token.expires_at {
+                                Some(exp) => exp.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                                None => "Never (Permanent)".to_string(),
+                            };
+                            println!("   Expires At:     {}", exp_str);
+                            println!("\n💡 Tip: Use with 'agentsec --token <TOKEN> <COMMAND>' or Bearer auth header.");
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Failed to create token: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Some(TokenAction::List) => {
+                    let client = DaemonClient::new(&config)?;
+                    match client.list_client_tokens().await {
+                        Ok(tokens) => {
+                            if tokens.is_empty() {
+                                println!("No named client tokens registered.");
+                                println!("💡 Create one with: agentsec token create <name>");
+                            } else {
+                                println!("Named Client Tokens ({} total):", tokens.len());
+                                println!("{:<20} {:<16} {:<24} {:<24}", "NAME", "PREVIEW", "NAMESPACES", "EXPIRES");
+                                println!("{}", "─".repeat(84));
+                                for t in tokens {
+                                    let exp_str = match t.expires_at {
+                                        Some(exp) => exp.format("%Y-%m-%d %H:%M").to_string(),
+                                        None => "Never".to_string(),
+                                    };
+                                    let ns_str = if t.namespaces.is_empty() {
+                                        "*".to_string()
+                                    } else {
+                                        t.namespaces.join(", ")
+                                    };
+                                    println!("{:<20} {:<16} {:<24} {:<24}", t.name, t.masked_preview, ns_str, exp_str);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Failed to list tokens: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Some(TokenAction::Revoke(revoke_args)) => {
+                    let client = DaemonClient::new(&config)?;
+                    match client.revoke_client_token(&revoke_args.name).await {
+                        Ok(revoked) => {
+                            if revoked {
+                                println!("🗑️ Successfully revoked client token '{}'", revoke_args.name);
+                            } else {
+                                println!("ℹ️ Client token '{}' was not found", revoke_args.name);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Failed to revoke token: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                None => {
+                    if args.rotate {
+                        let _ = std::fs::remove_file(&config.token_path);
+                        let new_token = config.get_or_create_auth_token()?;
+                        println!("🔑 Rotated API Auth Token:");
+                        println!("{}", new_token);
+                    } else {
+                        let token = config.get_or_create_auth_token()?;
+                        println!("🔑 Active Daemon API Auth Token:");
+                        println!("{}", token);
+                    }
+                }
             }
         }
 
