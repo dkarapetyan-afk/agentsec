@@ -31,7 +31,12 @@ async fn main() -> Result<()> {
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
 
-    let config = AppConfig::load(cli.config_dir.clone(), cli.port)?;
+    let config = AppConfig::load_with_overrides(
+        cli.config_dir.clone(),
+        cli.port,
+        cli.url.clone(),
+        cli.token.clone(),
+    )?;
 
     match cli.command {
         Commands::Daemon(daemon_args) => {
@@ -44,12 +49,21 @@ async fn main() -> Result<()> {
 
             let vault = Vault::new(master_key, vault_path.clone())?;
             let token = config.get_or_create_auth_token()?;
+            let tunnel_url = config.read_tunnel_url();
 
             println!("╔══════════════════════════════════════════════════════════╗");
             println!("║              agentsec Secret Manager Daemon              ║");
             println!("╠══════════════════════════════════════════════════════════╣");
             println!("║ Status:     Active & Listening                           ║");
             println!("║ Address:    http://{:<36} ║", format!("{}:{}", config.host, config.port));
+            if let Some(ref tunnel) = tunnel_url {
+                let short_tunnel = if tunnel.len() > 44 {
+                    format!("{}...", &tunnel[..41])
+                } else {
+                    tunnel.clone()
+                };
+                println!("║ Tunnel URL: {:<44} ║", short_tunnel);
+            }
             println!("║ Storage:    {:<44} ║", if daemon_args.ephemeral { "Ephemeral RAM-only" } else { "AES-256 / ChaCha20 Encrypted Vault" });
             if let Some(ref path) = vault_path {
                 let path_str = path.to_string_lossy();
@@ -74,6 +88,9 @@ async fn main() -> Result<()> {
                     println!("Process ID:       {}", status.pid);
                     println!("Version:          {}", status.version);
                     println!("Endpoint:         http://{}:{}", status.host, status.port);
+                    if let Some(ref tunnel) = status.tunnel_url {
+                        println!("Tunnel URL:       {}", tunnel);
+                    }
                     println!("Uptime:           {}s", status.uptime_seconds);
                     println!("Namespaces:       {}", status.stats.namespaces_count);
                     println!("Active Secrets:   {}", status.stats.active_secrets_count);

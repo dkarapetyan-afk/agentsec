@@ -18,14 +18,20 @@ pub struct DaemonClient {
 
 impl DaemonClient {
     pub fn new(config: &AppConfig) -> Result<Self> {
-        let (host, port) = if let Ok(Some(info)) = config.read_daemon_info() {
-            (info.host, info.port)
+        let base_url = if let Some(ref url) = config.custom_url {
+            let trimmed = url.trim().trim_end_matches('/');
+            if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                trimmed.to_string()
+            } else {
+                format!("https://{}", trimmed)
+            }
+        } else if let Ok(Some(info)) = config.read_daemon_info() {
+            format!("http://{}:{}", info.host, info.port)
         } else {
-            (config.host.clone(), config.port)
+            format!("http://{}:{}", config.host, config.port)
         };
 
         let auth_token = config.get_or_create_auth_token()?;
-        let base_url = format!("http://{}:{}", host, port);
 
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(5))

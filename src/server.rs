@@ -21,9 +21,11 @@ use tracing::{error, info};
 pub struct ServerState {
     pub vault: Vault,
     pub auth_token: String,
+    pub external_token: Option<String>,
     pub started_at: DateTime<Utc>,
     pub port: u16,
     pub host: String,
+    pub config_dir: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +40,8 @@ pub struct StatusResponse {
     pub version: String,
     pub host: String,
     pub port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel_url: Option<String>,
     pub started_at: DateTime<Utc>,
     pub uptime_seconds: i64,
     pub stats: VaultStats,
@@ -116,14 +120,44 @@ pub fn create_router(state: ServerState) -> Router {
         .with_state(Arc::new(state))
 }
 
-// Authentication helper
-fn verify_auth(headers: &HeaderMap, expected_token: &str) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let auth_header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
+/// Check if the HTTP request originated from outside (via Cloudflare Tunnel / reverse proxy)
+pub fn is_external_request(headers: &HeaderMap) -> bool {
+    if headers.contains_key("cf-connecting-ip")
+        || headers.contains_key("cf-ray")
+        || headers.contains_key("cf-visitor")
+        || headers.contains_key("x-forwarded-for")
+    {
+        return true;
+    }
 
-    match auth_header {
-        Some(header) if header.starts_with("Bearer ") => {
-            let token = &header[7..];
-            if token == expected_token {
+    if let Some(host) = headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()) {
+        let domain = host.split(':').next().unwrap_or(host).trim();
+        if domain != "127.0.0.1" && domain != "localhost" && domain != "::1" && !domain.is_empty() {
+            return true;
+        }
+    }
+
+    false
+}
+
+// Authentication helper
+fn verify_auth(
+    headers: &HeaderMap,
+    expected_token: &str,
+    external_token: Option<&str>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let token_candidate = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-auth-token").and_then(|v| v.to_str().ok()));
+
+    match token_candidate {
+        Some(token) => {
+            let matches_primary = token == expected_token;
+            let matches_external = external_token.map_or(false, |ext| token == ext);
+
+            if matches_primary || matches_external {
                 Ok(())
             } else {
                 Err((
@@ -134,7 +168,7 @@ fn verify_auth(headers: &HeaderMap, expected_token: &str) -> Result<(), (StatusC
                 ))
             }
         }
-        _ => Err((
+        None => Err((
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
                 error: "Missing or malformed Authorization header (Bearer <token> required)".to_string(),
@@ -145,27 +179,45 @@ fn verify_auth(headers: &HeaderMap, expected_token: &str) -> Result<(), (StatusC
 
 // Handlers
 
-async fn health_handler() -> impl IntoResponse {
-    Json(HealthResponse {
+async fn health_handler(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if is_external_request(&headers) {
+        verify_auth(&headers, &state.auth_token, state.external_token.as_deref())?;
+    }
+
+    Ok(Json(HealthResponse {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-    })
+    }))
 }
 
 async fn status_handler(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    verify_auth(&headers, &state.auth_token)?;
+    verify_auth(&headers, &state.auth_token, state.external_token.as_deref())?;
 
     let now = Utc::now();
     let uptime = (now - state.started_at).num_seconds();
+
+    let tunnel_path = state.config_dir.join("tunnel.url");
+    let tunnel_url = if tunnel_path.exists() {
+        std::fs::read_to_string(&tunnel_path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
 
     Ok(Json(StatusResponse {
         pid: std::process::id(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         host: state.host.clone(),
         port: state.port,
+        tunnel_url,
         started_at: state.started_at,
         uptime_seconds: uptime,
         stats: state.vault.stats(),
@@ -176,7 +228,7 @@ async fn list_namespaces_handler(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    verify_auth(&headers, &state.auth_token)?;
+    verify_auth(&headers, &state.auth_token, state.external_token.as_deref())?;
 
     let namespaces = state.vault.list_namespaces();
     Ok(Json(NamespacesResponse { namespaces }))
@@ -187,7 +239,7 @@ async fn delete_namespace_handler(
     headers: HeaderMap,
     Path(namespace): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    verify_auth(&headers, &state.auth_token)?;
+    verify_auth(&headers, &state.auth_token, state.external_token.as_deref())?;
 
     match state.vault.delete_namespace(&namespace) {
         Ok(count) => Ok(Json(DeleteNamespaceResponse {
@@ -208,7 +260,7 @@ async fn list_secrets_handler(
     headers: HeaderMap,
     Path(namespace): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    verify_auth(&headers, &state.auth_token)?;
+    verify_auth(&headers, &state.auth_token, state.external_token.as_deref())?;
 
     let secrets = state.vault.list_secrets(&namespace);
     let count = secrets.len();
@@ -224,7 +276,7 @@ async fn get_secret_handler(
     headers: HeaderMap,
     Path((namespace, key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    verify_auth(&headers, &state.auth_token)?;
+    verify_auth(&headers, &state.auth_token, state.external_token.as_deref())?;
 
     match state.vault.get(&namespace, &key) {
         Some(entry) => Ok(Json(SecretDetailResponse {
@@ -248,7 +300,7 @@ async fn set_secret_handler(
     Path((namespace, key)): Path<(String, String)>,
     Json(payload): Json<SetSecretRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    verify_auth(&headers, &state.auth_token)?;
+    verify_auth(&headers, &state.auth_token, state.external_token.as_deref())?;
 
     if payload.value.trim().is_empty() {
         return Err((
@@ -282,7 +334,7 @@ async fn delete_secret_handler(
     headers: HeaderMap,
     Path((namespace, key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    verify_auth(&headers, &state.auth_token)?;
+    verify_auth(&headers, &state.auth_token, state.external_token.as_deref())?;
 
     match state.vault.delete(&namespace, &key) {
         Ok(deleted) => Ok(Json(DeleteSecretResponse {
@@ -304,7 +356,7 @@ async fn export_namespace_handler(
     headers: HeaderMap,
     Path(namespace): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    verify_auth(&headers, &state.auth_token)?;
+    verify_auth(&headers, &state.auth_token, state.external_token.as_deref())?;
 
     let secrets = state.vault.export_namespace(&namespace);
     Ok(Json(ExportNamespaceResponse {
@@ -320,12 +372,19 @@ pub async fn start_server(config: AppConfig, vault: Vault, auth_token: String) -
         .parse()
         .with_context(|| format!("Invalid host/port: {}:{}", config.host, config.port))?;
 
+    let external_token = std::env::var("AGENTSEC_EXTERNAL_TOKEN")
+        .or_else(|_| std::env::var("TUNNEL_AUTH_TOKEN"))
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+
     let state = ServerState {
         vault,
         auth_token,
+        external_token,
         started_at,
         port: config.port,
         host: config.host.clone(),
+        config_dir: config.config_dir.clone(),
     };
 
     let app = create_router(state);
@@ -340,6 +399,7 @@ pub async fn start_server(config: AppConfig, vault: Vault, auth_token: String) -
         host: config.host.clone(),
         socket_path: config.socket_path.clone(),
         started_at,
+        tunnel_url: config.read_tunnel_url(),
     };
 
     config.write_daemon_info(&daemon_info)?;

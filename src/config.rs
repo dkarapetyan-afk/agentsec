@@ -18,6 +18,8 @@ pub struct DaemonInfo {
     pub host: String,
     pub socket_path: PathBuf,
     pub started_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -29,12 +31,24 @@ pub struct AppConfig {
     pub token_path: PathBuf,
     pub socket_path: PathBuf,
     pub daemon_info_path: PathBuf,
+    pub tunnel_url_path: PathBuf,
     pub port: u16,
     pub host: String,
+    pub custom_url: Option<String>,
+    pub custom_token: Option<String>,
 }
 
 impl AppConfig {
     pub fn load(custom_config_dir: Option<PathBuf>, custom_port: Option<u16>) -> Result<Self> {
+        Self::load_with_overrides(custom_config_dir, custom_port, None, None)
+    }
+
+    pub fn load_with_overrides(
+        custom_config_dir: Option<PathBuf>,
+        custom_port: Option<u16>,
+        custom_url: Option<String>,
+        custom_token: Option<String>,
+    ) -> Result<Self> {
         let (config_dir, data_dir) = if let Some(dir) = custom_config_dir {
             (dir.clone(), dir)
         } else if let Ok(env_dir) = std::env::var("AGENTSEC_CONFIG_DIR") {
@@ -67,6 +81,7 @@ impl AppConfig {
         let token_path = config_dir.join("token");
         let socket_path = data_dir.join("daemon.sock");
         let daemon_info_path = data_dir.join("daemon.json");
+        let tunnel_url_path = config_dir.join("tunnel.url");
 
         let port = custom_port
             .or_else(|| {
@@ -78,6 +93,13 @@ impl AppConfig {
 
         let host = std::env::var("AGENTSEC_HOST").unwrap_or_else(|_| DEFAULT_HOST.to_string());
 
+        let url = custom_url
+            .or_else(|| std::env::var("AGENTSEC_URL").ok())
+            .or_else(|| std::env::var("AGENTSEC_SERVER_URL").ok());
+
+        let token_override = custom_token
+            .or_else(|| std::env::var("AGENTSEC_TOKEN").ok());
+
         Ok(Self {
             config_dir,
             data_dir,
@@ -86,13 +108,23 @@ impl AppConfig {
             token_path,
             socket_path,
             daemon_info_path,
+            tunnel_url_path,
             port,
             host,
+            custom_url: url,
+            custom_token: token_override,
         })
     }
 
     /// Retrieve or generate the persistent API authentication token
     pub fn get_or_create_auth_token(&self) -> Result<String> {
+        if let Some(ref t) = self.custom_token {
+            let trimmed = t.trim();
+            if !trimmed.is_empty() {
+                return Ok(trimmed.to_string());
+            }
+        }
+
         if self.token_path.exists() {
             let token = fs::read_to_string(&self.token_path)?;
             let token = token.trim().to_string();
@@ -114,6 +146,29 @@ impl AppConfig {
         }
 
         Ok(token)
+    }
+
+    /// Read the active Cloudflare tunnel URL if recorded
+    pub fn read_tunnel_url(&self) -> Option<String> {
+        if self.tunnel_url_path.exists() {
+            if let Ok(content) = fs::read_to_string(&self.tunnel_url_path) {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Save the active Cloudflare tunnel URL
+    pub fn write_tunnel_url(&self, url: &str) -> Result<()> {
+        fs::write(&self.tunnel_url_path, url.trim())?;
+        #[cfg(unix)]
+        {
+            let _ = fs::set_permissions(&self.tunnel_url_path, fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
     }
 
     /// Save the active daemon process metadata
@@ -141,6 +196,7 @@ impl AppConfig {
     pub fn remove_daemon_info(&self) {
         let _ = fs::remove_file(&self.daemon_info_path);
         let _ = fs::remove_file(&self.socket_path);
+        let _ = fs::remove_file(&self.tunnel_url_path);
     }
 }
 

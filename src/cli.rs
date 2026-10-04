@@ -20,6 +20,12 @@ pub struct Cli {
     #[arg(short, long, global = true, help = "Daemon port override")]
     pub port: Option<u16>,
 
+    #[arg(long, global = true, env = "AGENTSEC_URL", help = "Remote daemon or tunnel URL override (e.g. https://xxx.trycloudflare.com)")]
+    pub url: Option<String>,
+
+    #[arg(long, global = true, env = "AGENTSEC_TOKEN", help = "Authentication token for connecting to the daemon")]
+    pub token: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }

@@ -194,3 +194,99 @@ async fn test_full_daemon_lifecycle_and_features() {
     server_handle.abort();
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[tokio::test]
+async fn test_external_vs_local_authentication_and_tunnel_url() {
+    let test_id = rand::random::<u64>();
+    let temp_dir = env::temp_dir().join(format!("agentsec_auth_test_{}", test_id));
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let port = 55000 + (test_id % 5000) as u16;
+    let config = AppConfig::load(Some(temp_dir.clone()), Some(port)).unwrap();
+    let auth_token = config.get_or_create_auth_token().unwrap();
+    let master_key = MasterKey::generate();
+    let vault = Vault::new(master_key, Some(config.vault_path.clone())).unwrap();
+
+    // Write a mock tunnel URL
+    let mock_tunnel_url = "https://agentsec-test-demo.trycloudflare.com";
+    config.write_tunnel_url(mock_tunnel_url).unwrap();
+
+    // Spawn server
+    let server_config = config.clone();
+    let server_vault = vault.clone();
+    let server_token = auth_token.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = start_server(server_config, server_vault, server_token).await;
+    });
+
+    sleep(Duration::from_millis(150)).await;
+
+    let http_client = reqwest::Client::new();
+    let base_local = format!("http://127.0.0.1:{}", port);
+
+    // 1. Local /health without auth should succeed (local connections still work as they are)
+    let resp_local = http_client
+        .get(format!("{}/health", base_local))
+        .send()
+        .await
+        .expect("Local health request failed");
+    assert_eq!(resp_local.status(), reqwest::StatusCode::OK);
+
+    // 2. External /health (with CF-Connecting-IP header) without auth MUST be rejected (401)
+    let resp_ext_unauth = http_client
+        .get(format!("{}/health", base_local))
+        .header("cf-connecting-ip", "203.0.113.195")
+        .send()
+        .await
+        .expect("External health request failed");
+    assert_eq!(resp_ext_unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // 3. External /health with invalid token MUST be rejected (401)
+    let resp_ext_bad_token = http_client
+        .get(format!("{}/health", base_local))
+        .header("cf-connecting-ip", "203.0.113.195")
+        .bearer_auth("invalid-token-12345")
+        .send()
+        .await
+        .expect("External health request failed");
+    assert_eq!(resp_ext_bad_token.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // 4. External /health with valid Bearer token MUST succeed (200)
+    let resp_ext_valid = http_client
+        .get(format!("{}/health", base_local))
+        .header("cf-connecting-ip", "203.0.113.195")
+        .bearer_auth(&auth_token)
+        .send()
+        .await
+        .expect("External health request failed");
+    assert_eq!(resp_ext_valid.status(), reqwest::StatusCode::OK);
+
+    // 5. External request with external Host header without auth MUST be rejected (401)
+    let resp_host_unauth = http_client
+        .get(format!("{}/health", base_local))
+        .header("Host", "custom-agentsec.trycloudflare.com")
+        .send()
+        .await
+        .expect("External host request failed");
+    assert_eq!(resp_host_unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // 6. Verify status reports the recorded tunnel_url
+    let client = DaemonClient::new(&config).expect("Client init failed");
+    let status = client.status().await.expect("Status check failed");
+    assert_eq!(status.tunnel_url.as_deref(), Some(mock_tunnel_url));
+
+    // 7. Verify DaemonClient with custom_url and custom_token works
+    let remote_config = AppConfig::load_with_overrides(
+        Some(temp_dir.clone()),
+        Some(port),
+        Some(format!("http://127.0.0.1:{}", port)),
+        Some(auth_token.clone()),
+    )
+    .unwrap();
+    let remote_client = DaemonClient::new(&remote_config).unwrap();
+    let remote_status = remote_client.status().await.unwrap();
+    assert_eq!(remote_status.pid, std::process::id());
+
+    server_handle.abort();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
