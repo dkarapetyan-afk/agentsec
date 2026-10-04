@@ -120,7 +120,7 @@ pub async fn run_mcp_server(client: DaemonClient) -> Result<()> {
     Ok(())
 }
 
-fn get_tool_definitions() -> Value {
+pub fn get_tool_definitions() -> Value {
     json!([
         {
             "name": "list_namespaces",
@@ -418,4 +418,189 @@ fn make_tool_error(id: Value, msg: &str) -> Value {
             "isError": true
         }
     })
+}
+
+pub fn handle_mcp_request(vault: &crate::store::Vault, req: Value) -> Value {
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    let method = match req.get("method").and_then(|v| v.as_str()) {
+        Some(m) => m,
+        None => {
+            return json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32600, "message": "Invalid Request: missing method" }
+            });
+        }
+    };
+    let params = req.get("params").cloned();
+
+    match method {
+        "initialize" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "agentsec",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        }),
+        "notifications/initialized" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {}
+        }),
+        "ping" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {}
+        }),
+        "tools/list" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "tools": get_tool_definitions()
+            }
+        }),
+        "tools/call" => {
+            let params = match params {
+                Some(p) => p,
+                None => return json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32602, "message": "Missing params" }
+                }),
+            };
+            let name = match params.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => return json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32602, "message": "Missing tool name" }
+                }),
+            };
+            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+            let default_ns = detect_workspace_namespace(None);
+            let resolve_ns = |args: &Value| -> String {
+                args.get("namespace")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&default_ns)
+                    .to_string()
+            };
+
+            match name {
+                "list_namespaces" => {
+                    let ns = vault.list_namespaces();
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": serde_json::to_string_pretty(&ns).unwrap_or_default()
+                            }]
+                        }
+                    })
+                }
+                "list_secrets" => {
+                    let ns = resolve_ns(&arguments);
+                    let secrets = vault.list_secrets(&ns);
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": serde_json::to_string_pretty(&secrets).unwrap_or_default()
+                            }]
+                        }
+                    })
+                }
+                "get_secret" => {
+                    let key = match arguments.get("key").and_then(|v| v.as_str()) {
+                        Some(k) => k,
+                        None => return make_tool_error(id, "Missing 'key' argument"),
+                    };
+                    let ns = resolve_ns(&arguments);
+                    match vault.get(&ns, key) {
+                        Some(entry) => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{
+                                    "type": "text",
+                                    "text": entry.value.expose_secret()
+                                }]
+                            }
+                        }),
+                        None => make_tool_error(id, &format!("Secret '{}' not found in namespace '{}'", key, ns)),
+                    }
+                }
+                "set_secret" => {
+                    let key = match arguments.get("key").and_then(|v| v.as_str()) {
+                        Some(k) => k,
+                        None => return make_tool_error(id, "Missing 'key' argument"),
+                    };
+                    let value = match arguments.get("value").and_then(|v| v.as_str()) {
+                        Some(v) => v,
+                        None => return make_tool_error(id, "Missing 'value' argument"),
+                    };
+                    let ns = resolve_ns(&arguments);
+                    let desc = arguments.get("description").and_then(|v| v.as_str()).map(String::from);
+                    let ttl = arguments.get("ttl_seconds").and_then(|v| v.as_u64());
+
+                    match vault.set(&ns, key, value, desc, vec![], ttl) {
+                        Ok(meta) => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{
+                                    "type": "text",
+                                    "text": format!("Stored secret '{}' in namespace '{}' (preview: {})", meta.name, meta.namespace, meta.masked_preview)
+                                }]
+                            }
+                        }),
+                        Err(e) => make_tool_error(id, &e.to_string()),
+                    }
+                }
+                "delete_secret" => {
+                    let key = match arguments.get("key").and_then(|v| v.as_str()) {
+                        Some(k) => k,
+                        None => return make_tool_error(id, "Missing 'key' argument"),
+                    };
+                    let ns = resolve_ns(&arguments);
+                    match vault.delete(&ns, key) {
+                        Ok(deleted) => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{
+                                    "type": "text",
+                                    "text": if deleted {
+                                        format!("Deleted secret '{}' from namespace '{}'", key, ns)
+                                    } else {
+                                        format!("Secret '{}' not found in namespace '{}'", key, ns)
+                                    }
+                                }]
+                            }
+                        }),
+                        Err(e) => make_tool_error(id, &e.to_string()),
+                    }
+                }
+                other => make_tool_error(id, &format!("Unknown tool: {}", other)),
+            }
+        }
+        other => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32601,
+                "message": format!("Method not found: {}", other)
+            }
+        }),
+    }
 }

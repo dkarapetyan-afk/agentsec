@@ -7,11 +7,13 @@ use axum::{
     extract::{Path, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{delete, get},
+    routing::{delete, get, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use crate::mcp::handle_mcp_request;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -142,6 +144,8 @@ pub fn create_router(state: ServerState) -> Router {
         .route("/v1/export/:namespace", get(export_namespace_handler))
         .route("/v1/tokens", get(list_tokens_handler).post(create_token_handler))
         .route("/v1/tokens/:name", delete(revoke_token_handler))
+        .route("/mcp", post(mcp_post_handler).get(mcp_get_handler))
+        .route("/v1/mcp", post(mcp_post_handler).get(mcp_get_handler))
         .with_state(Arc::new(state))
 }
 
@@ -478,6 +482,38 @@ async fn revoke_token_handler(
             }),
         )),
     }
+}
+
+async fn mcp_get_handler(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if is_external_request(&headers) {
+        let tokens = state.client_tokens.read().await;
+        verify_auth(&headers, &state.auth_token, state.external_token.as_deref(), &tokens, None)?;
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "service": "agentsec-mcp",
+        "transport": "streamable-http",
+        "protocolVersion": "2024-11-05",
+        "tools": crate::mcp::get_tool_definitions()
+    })))
+}
+
+async fn mcp_post_handler(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    {
+        let tokens = state.client_tokens.read().await;
+        verify_auth(&headers, &state.auth_token, state.external_token.as_deref(), &tokens, None)?;
+    }
+
+    let response = handle_mcp_request(&state.vault, payload);
+    Ok(Json(response))
 }
 
 /// Run the background HTTP daemon server with graceful shutdown handling
