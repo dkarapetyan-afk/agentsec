@@ -275,28 +275,28 @@ pub fn create_router(state: ServerState) -> Router {
         .route("/v1/status", get(status_handler))
         .route("/v1/namespaces", get(list_namespaces_handler))
         .route(
-            "/v1/namespaces/:namespace",
+            "/v1/namespaces/{namespace}",
             delete(delete_namespace_handler),
         )
-        .route("/v1/secrets/:namespace", get(list_secrets_handler))
+        .route("/v1/secrets/{namespace}", get(list_secrets_handler))
         .route(
-            "/v1/secrets/:namespace/:key",
+            "/v1/secrets/{namespace}/{key}",
             get(get_secret_handler)
                 .post(set_secret_handler)
                 .delete(delete_secret_handler),
         )
         .route(
-            "/v1/secrets/:namespace/:key/renew",
+            "/v1/secrets/{namespace}/{key}/renew",
             post(renew_secret_handler),
         )
-        .route("/v1/export/:namespace", get(export_namespace_handler))
-        .route("/v1/inject/:namespace", post(inject_handler))
+        .route("/v1/export/{namespace}", get(export_namespace_handler))
+        .route("/v1/inject/{namespace}", post(inject_handler))
         .route(
             "/v1/tokens",
             get(list_tokens_handler).post(create_token_handler),
         )
-        .route("/v1/tokens/:name", delete(revoke_token_handler))
-        .route("/v1/tokens/:name/renew", post(renew_token_handler))
+        .route("/v1/tokens/{name}", delete(revoke_token_handler))
+        .route("/v1/tokens/{name}/renew", post(renew_token_handler))
         .route("/v1/token/rotate", post(rotate_token_handler))
         .route("/v1/audit", get(audit_handler))
         .route("/mcp", post(mcp_post_handler).get(mcp_get_handler))
