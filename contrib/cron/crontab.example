@@ -1,0 +1,14 @@
+# Example crontab configuration for agentsec daemon monitoring
+#
+# To install:
+#   crontab -e
+# Or append to existing crontab:
+#   (crontab -l 2>/dev/null; cat contrib/cron/crontab.example) | crontab -
+#
+# Option A: Built-in binary watchdog (recommended, no extra scripts needed)
+* * * * * agentsec service watchdog --quiet >> ~/.config/agentsec/watchdog.log 2>&1
+@reboot   agentsec service watchdog --quiet >> ~/.config/agentsec/watchdog.log 2>&1
+
+# Option B: Standalone shell watchdog script
+# * * * * * ~/.cargo/bin/agentsec-watchdog.sh >> ~/.config/agentsec/watchdog.log 2>&1
+# @reboot   ~/.cargo/bin/agentsec-watchdog.sh >> ~/.config/agentsec/watchdog.log 2>&1

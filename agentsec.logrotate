@@ -6,5 +6,5 @@
     missingok
     notifempty
     copytruncate
-    create 0664 terry terry
+    create 0664
 }

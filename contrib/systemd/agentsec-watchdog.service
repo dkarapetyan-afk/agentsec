@@ -1,0 +1,10 @@
+[Unit]
+Description=agentsec daemon health watchdog probe
+Documentation=https://github.com/agentsec/agentsec
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.cargo/bin/agentsec service watchdog --quiet
+StandardOutput=journal
+StandardError=journal

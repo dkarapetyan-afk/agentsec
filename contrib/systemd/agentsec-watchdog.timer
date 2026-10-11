@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic health watchdog timer for agentsec daemon
+Documentation=https://github.com/agentsec/agentsec
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
