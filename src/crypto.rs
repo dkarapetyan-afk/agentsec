@@ -4,7 +4,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Nonce,
 };
-use rand::{rngs::OsRng, RngCore};
+use rand::Rng;
 use std::fs;
 use std::path::Path;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -25,7 +25,7 @@ impl MasterKey {
 
     pub fn generate() -> Self {
         let mut bytes = [0u8; KEY_SIZE];
-        OsRng.fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         Self(bytes)
     }
 
@@ -41,7 +41,7 @@ pub fn encrypt_bytes(key: &MasterKey, plaintext: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| anyhow!("Failed to initialize cipher: {}", e))?;
 
     let mut nonce_bytes = [0u8; NONCE_SIZE];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    rand::rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher

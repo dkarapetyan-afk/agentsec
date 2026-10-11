@@ -12,7 +12,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
@@ -831,7 +831,7 @@ async fn rotate_token_handler(
     }
     let mut current = state.auth_token.write().await;
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let token = hex::encode(bytes);
     state.config.save_auth_token(&token).map_err(|_| {
         api_error(
