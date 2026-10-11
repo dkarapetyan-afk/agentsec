@@ -42,10 +42,10 @@ pub fn encrypt_bytes(key: &MasterKey, plaintext: &[u8]) -> Result<Vec<u8>> {
 
     let mut nonce_bytes = [0u8; NONCE_SIZE];
     OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|e| anyhow!("Encryption error: {}", e))?;
 
     let mut result = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
@@ -62,13 +62,13 @@ pub fn decrypt_bytes(key: &MasterKey, encrypted_payload: &[u8]) -> Result<Vec<u8
     }
 
     let (nonce_bytes, ciphertext) = encrypted_payload.split_at(NONCE_SIZE);
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::try_from(nonce_bytes).map_err(|e| anyhow!("Invalid nonce size: {}", e))?;
 
     let cipher = ChaCha20Poly1305::new_from_slice(key.as_bytes())
         .map_err(|e| anyhow!("Failed to initialize cipher: {}", e))?;
 
     let plaintext = cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|e| anyhow!("Decryption error (corrupted data or invalid key): {}", e))?;
 
     Ok(plaintext)
