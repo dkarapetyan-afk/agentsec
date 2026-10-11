@@ -236,7 +236,7 @@ pub fn install_supervision(backend: &str, dry_run: bool) -> Result<()> {
             let content = format!(
                 "[Unit]\n\
                  Description=agentsec secret management daemon\n\
-                 Documentation=https://github.com/agentsec/agentsec\n\
+                 Documentation=https://github.com/dkarapetyan-afk/agentsec\n\
                  After=network.target\n\n\
                  [Service]\n\
                  Type=simple\n\

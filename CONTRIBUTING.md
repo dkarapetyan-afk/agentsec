@@ -13,7 +13,7 @@ Thank you for your interest in contributing to **agentsec**! We welcome contribu
 
 ### Clone and Build
 ```bash
-git clone https://github.com/agentsec/agentsec.git
+git clone https://github.com/dkarapetyan-afk/agentsec.git
 cd agentsec
 
 # Build in debug mode

@@ -1,6 +1,6 @@
 [Unit]
 Description=Periodic health watchdog timer for agentsec daemon
-Documentation=https://github.com/agentsec/agentsec
+Documentation=https://github.com/dkarapetyan-afk/agentsec
 
 [Timer]
 OnBootSec=1min

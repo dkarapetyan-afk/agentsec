@@ -1,6 +1,6 @@
 [Unit]
 Description=agentsec daemon health watchdog probe
-Documentation=https://github.com/agentsec/agentsec
+Documentation=https://github.com/dkarapetyan-afk/agentsec
 After=network.target
 
 [Service]
