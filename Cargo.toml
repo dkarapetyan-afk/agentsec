@@ -1,9 +1,25 @@
 [package]
 name = "agentsec"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A local daemon and CLI that securely manages namespaced secrets for coding agents"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/agentsec/agentsec"
+homepage = "https://github.com/agentsec/agentsec"
+documentation = "https://docs.rs/agentsec"
+keywords = ["secrets", "security", "ai-agents", "mcp", "credentials"]
+categories = ["command-line-utilities", "cryptography", "development-tools"]
+exclude = [
+    ".grok/",
+    ".cursor/",
+    "session-id",
+    "agentsec-watchdog.sh",
+    "agentsec.logrotate",
+    "install-skill.sh",
+    "contrib/",
+    ".github/",
+]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }

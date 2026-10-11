@@ -5,3 +5,8 @@
 daemon.json
 token
 .env*
+session-id
+*.log
+*.pid
+.DS_Store
+Thumbs.db
