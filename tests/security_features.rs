@@ -502,10 +502,15 @@ async fn stdio_mcp_rejects_out_of_scope_keys_and_redacts_child_output() {
         .await
         .unwrap();
     let config_dir = fixture.directory.clone();
+    #[cfg(unix)]
+    let command = "printf '%s' \"$API_KEY\"; printf '%s' \"$API_KEY\" >&2";
+    #[cfg(windows)]
+    let command = "echo %API_KEY%&echo %API_KEY% 1>&2";
+
     let input = [
         json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
         json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_secret","arguments":{"namespace":"repo:one","key":"OTHER_KEY"}}}),
-        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_command_with_secrets","arguments":{"namespace":"repo:one","only":["API_KEY"],"command":"printf '%s' \"$API_KEY\"; printf '%s' \"$API_KEY\" >&2"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_command_with_secrets","arguments":{"namespace":"repo:one","only":["API_KEY"],"command":command}}}),
     ];
     let result = tokio::task::spawn_blocking(move || {
         use std::io::Write;
@@ -534,6 +539,7 @@ async fn stdio_mcp_rejects_out_of_scope_keys_and_redacts_child_output() {
     assert!(!String::from_utf8_lossy(&result.stderr).contains("dummy-stdio-private-value"));
     let messages = stdout
         .lines()
+        .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(messages.len(), 2);
@@ -544,8 +550,8 @@ async fn stdio_mcp_rejects_out_of_scope_keys_and_redacts_child_output() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(output["stdout"], "[REDACTED]");
-    assert_eq!(output["stderr"], "[REDACTED]");
+    assert_eq!(output["stdout"].as_str().unwrap().trim(), "[REDACTED]");
+    assert_eq!(output["stderr"].as_str().unwrap().trim(), "[REDACTED]");
 }
 
 #[test]
