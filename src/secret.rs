@@ -58,9 +58,13 @@ pub struct SecretMetadata {
 }
 
 impl SecretMetadata {
+    pub fn remaining_ttl_seconds(&self) -> Option<i64> {
+        self.expires_at
+            .map(|e| (e - Utc::now()).num_seconds().max(0))
+    }
     pub fn is_expired(&self) -> bool {
         if let Some(exp) = self.expires_at {
-            Utc::now() > exp
+            Utc::now() >= exp
         } else {
             false
         }

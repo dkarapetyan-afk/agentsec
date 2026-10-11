@@ -92,8 +92,8 @@ pub fn get_or_create_master_key(path: &Path) -> Result<MasterKey> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read master key from {:?}", path))?;
         let trimmed = content.trim();
-        let bytes = hex::decode(trimmed)
-            .with_context(|| "Invalid hex encoding in master key file")?;
+        let bytes =
+            hex::decode(trimmed).with_context(|| "Invalid hex encoding in master key file")?;
         if bytes.len() != KEY_SIZE {
             return Err(anyhow!(
                 "Invalid master key length: expected {} bytes, got {}",
@@ -150,7 +150,8 @@ mod tests {
 
     #[test]
     fn test_master_key_file() {
-        let temp_dir = env::temp_dir().join(format!("agentsec_crypto_test_{}", rand::random::<u64>()));
+        let temp_dir =
+            env::temp_dir().join(format!("agentsec_crypto_test_{}", rand::random::<u64>()));
         let _ = fs::create_dir_all(&temp_dir);
         let key_path = temp_dir.join("master.key");
 

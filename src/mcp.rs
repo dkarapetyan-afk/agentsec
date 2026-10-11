@@ -1,122 +1,36 @@
 use crate::client::DaemonClient;
 use crate::config::detect_workspace_namespace;
+use crate::runner::{run_capture, RunOptions};
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
-use std::process::{Command, Stdio};
-
-#[derive(Serialize, Deserialize, Debug)]
-struct JsonRpcRequest {
-    jsonrpc: String,
-    id: Option<Value>,
-    method: String,
-    #[serde(default)]
-    params: Option<Value>,
-}
-
-
 
 pub async fn run_mcp_server(client: DaemonClient) -> Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
-
     for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("[agentsec-mcp] Error reading stdin: {}", e);
-                break;
-            }
-        };
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let line = line?;
+        if line.trim().is_empty() {
             continue;
         }
-
-        let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
-            Ok(req) => req,
-            Err(e) => {
-                let err_resp = json!({
-                    "jsonrpc": "2.0",
-                    "id": null,
-                    "error": {
-                        "code": -32700,
-                        "message": format!("Parse error: {}", e)
-                    }
-                });
-                writeln!(stdout, "{}", serde_json::to_string(&err_resp)?)?;
+        let request = match serde_json::from_str::<Value>(&line) {
+            Ok(value) => value,
+            Err(_) => {
+                writeln!(
+                    stdout,
+                    "{}",
+                    json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Invalid JSON"}})
+                )?;
                 stdout.flush()?;
                 continue;
             }
         };
-
-        let id = request.id.clone().unwrap_or(Value::Null);
-
-        match request.method.as_str() {
-            "initialize" => {
-                let response = json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {
-                            "tools": {}
-                        },
-                        "serverInfo": {
-                            "name": "agentsec",
-                            "version": env!("CARGO_PKG_VERSION")
-                        }
-                    }
-                });
-                writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
-                stdout.flush()?;
-            }
-            "notifications/initialized" => {
-                // No response needed for notification
-            }
-            "ping" => {
-                let response = json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {}
-                });
-                writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
-                stdout.flush()?;
-            }
-            "tools/list" => {
-                let tools = get_tool_definitions();
-                let response = json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "tools": tools
-                    }
-                });
-                writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
-                stdout.flush()?;
-            }
-            "tools/call" => {
-                let response = handle_tool_call(&client, id, request.params).await;
-                writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
-                stdout.flush()?;
-            }
-            other => {
-                let err_resp = json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": -32601,
-                        "message": format!("Method not found: {}", other)
-                    }
-                });
-                writeln!(stdout, "{}", serde_json::to_string(&err_resp)?)?;
-                stdout.flush()?;
-            }
+        let response = handle_mcp_request(&client, request).await;
+        if !response.is_null() {
+            writeln!(stdout, "{}", response)?;
+            stdout.flush()?;
         }
     }
-
     Ok(())
 }
 
@@ -192,6 +106,21 @@ pub fn get_tool_definitions() -> Value {
             }
         },
         {
+            "name": "renew_secret",
+            "description": "Extend an active expiring secret lease, up to 86400 seconds from now. Cannot revive expired secrets.",
+            "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}, "namespace": {"type": "string"}, "ttl_seconds": {"type": "integer", "minimum": 1, "maximum": 86400}}, "required": ["key", "ttl_seconds"]}
+        },
+        {
+            "name": "doctor",
+            "description": "Check daemon health, namespace, required key metadata, version compatibility, and MCP discovery without exposing values.",
+            "inputSchema": {"type": "object", "properties": {"namespace": {"type": "string"}, "required_keys": {"type": "array", "items": {"type": "string"}}}}
+        },
+        {
+            "name": "get_audit_events",
+            "description": "Read recent secret-free audit metadata. Requires an administrator credential.",
+            "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 1000}}}
+        },
+        {
             "name": "delete_secret",
             "description": "Deletes a secret from a namespace in the daemon.",
             "inputSchema": {
@@ -215,6 +144,9 @@ pub fn get_tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Program and arguments; prefer this over a shell string."},
+                    "only": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Inject only these secret keys."},
+                    "clean_env": {"type": "boolean", "default": true},
                     "command": {
                         "type": "string",
                         "description": "The shell command to execute (e.g. 'npm test', 'python app.py')"
@@ -224,383 +156,176 @@ pub fn get_tool_definitions() -> Value {
                         "description": "Optional namespace. If omitted, automatically resolves to current workspace namespace."
                     }
                 },
-                "required": ["command"]
+                "anyOf": [{"required": ["command"]}, {"required": ["argv"]}]
             }
         }
     ])
 }
 
-async fn handle_tool_call(client: &DaemonClient, id: Value, params: Option<Value>) -> Value {
-    let params = match params {
-        Some(p) => p,
-        None => {
-            return json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": -32602, "message": "Missing params" }
-            })
-        }
+fn tool_result(id: Value, content: String) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":content}]}})
+}
+fn tool_error(id: Value, message: impl ToString) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"result":{"isError":true,"content":[{"type":"text","text":message.to_string()}]}})
+}
+fn string_array(args: &Value, key: &str) -> Result<Option<Vec<String>>> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
     };
-
-    let name = match params.get("name").and_then(|v| v.as_str()) {
-        Some(n) => n,
-        None => {
-            return json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": -32602, "message": "Missing tool name" }
+    let array = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("'{}' must be an array", key))?;
+    Ok(Some(
+        array
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow::anyhow!("'{}' must contain strings", key))
             })
-        }
-    };
-
-    let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-
+            .collect::<Result<Vec<_>>>()?,
+    ))
+}
+async fn call(client: &DaemonClient, name: &str, args: &Value) -> Result<String> {
     let default_ns = detect_workspace_namespace(None);
-
-    let resolve_ns = |args: &Value| -> String {
-        args.get("namespace")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&default_ns)
-            .to_string()
+    let namespace = match args.get("namespace") {
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Namespace must be a string"))?,
+        None => &default_ns,
     };
-
+    let key = || {
+        args.get("key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Missing 'key' argument"))
+    };
     match name {
-        "list_namespaces" => match client.list_namespaces().await {
-            Ok(ns) => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "content": [{
-                        "type": "text",
-                        "text": serde_json::to_string_pretty(&ns).unwrap()
-                    }]
-                }
-            }),
-            Err(e) => make_tool_error(id, &e.to_string()),
-        },
-        "list_secrets" => {
-            let ns = resolve_ns(&arguments);
-            match client.list_secrets(&ns).await {
-                Ok(secrets) => json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "content": [{
-                            "type": "text",
-                            "text": serde_json::to_string_pretty(&secrets).unwrap()
-                        }]
-                    }
-                }),
-                Err(e) => make_tool_error(id, &e.to_string()),
-            }
-        }
-        "get_secret" => {
-            let key = match arguments.get("key").and_then(|v| v.as_str()) {
-                Some(k) => k,
-                None => return make_tool_error(id, "Missing 'key' argument"),
-            };
-            let ns = resolve_ns(&arguments);
-            match client.get_secret(&ns, key).await {
-                Ok(detail) => json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "content": [{
-                            "type": "text",
-                            "text": detail.value
-                        }]
-                    }
-                }),
-                Err(e) => make_tool_error(id, &e.to_string()),
-            }
-        }
+        "list_namespaces" => Ok(serde_json::to_string(&client.list_namespaces().await?)?),
+        "list_secrets" => Ok(serde_json::to_string(
+            &client.list_secrets(namespace).await?,
+        )?),
+        "get_secret" => Ok(client.get_secret(namespace, key()?).await?.value),
         "set_secret" => {
-            let key = match arguments.get("key").and_then(|v| v.as_str()) {
-                Some(k) => k,
-                None => return make_tool_error(id, "Missing 'key' argument"),
+            let value = args
+                .get("value")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("Missing 'value' argument"))?;
+            let description = args
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let ttl = match args.get("ttl_seconds") {
+                Some(value) => Some(
+                    value
+                        .as_u64()
+                        .ok_or_else(|| anyhow::anyhow!("TTL must be a positive integer"))?,
+                ),
+                None => None,
             };
-            let value = match arguments.get("value").and_then(|v| v.as_str()) {
-                Some(v) => v,
-                None => return make_tool_error(id, "Missing 'value' argument"),
-            };
-            let ns = resolve_ns(&arguments);
-            let desc = arguments.get("description").and_then(|v| v.as_str()).map(String::from);
-            let ttl = arguments.get("ttl_seconds").and_then(|v| v.as_u64());
-
-            match client.set_secret(&ns, key, value, desc, vec![], ttl).await {
-                Ok(meta) => json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "content": [{
-                            "type": "text",
-                            "text": format!("Successfully stored secret '{}' in namespace '{}' (preview: {})", meta.name, meta.namespace, meta.masked_preview)
-                        }]
-                    }
-                }),
-                Err(e) => make_tool_error(id, &e.to_string()),
-            }
+            let meta = client
+                .set_secret(namespace, key()?, value, description, vec![], ttl)
+                .await?;
+            Ok(serde_json::to_string(&meta)?)
         }
-        "delete_secret" => {
-            let key = match arguments.get("key").and_then(|v| v.as_str()) {
-                Some(k) => k,
-                None => return make_tool_error(id, "Missing 'key' argument"),
-            };
-            let ns = resolve_ns(&arguments);
-            match client.delete_secret(&ns, key).await {
-                Ok(deleted) => json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "content": [{
-                            "type": "text",
-                            "text": if deleted {
-                                format!("Secret '{}' removed from namespace '{}'", key, ns)
-                            } else {
-                                format!("Secret '{}' did not exist in namespace '{}'", key, ns)
-                            }
-                        }]
-                    }
-                }),
-                Err(e) => make_tool_error(id, &e.to_string()),
-            }
+        "delete_secret" => Ok(serde_json::to_string(
+            &json!({"deleted":client.delete_secret(namespace, key()?).await?}),
+        )?),
+        "renew_secret" => {
+            let ttl = args
+                .get("ttl_seconds")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow::anyhow!("Missing integer 'ttl_seconds'"))?;
+            Ok(serde_json::to_string(
+                &client.renew_secret(namespace, key()?, ttl).await?,
+            )?)
         }
+        "get_audit_events" => Ok(serde_json::to_string(
+            &client
+                .audit_events(
+                    args.get("limit")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(50)
+                        .min(1000) as usize,
+                )
+                .await?,
+        )?),
+        "doctor" => Ok(serde_json::to_string(
+            &crate::doctor::diagnose(
+                client,
+                namespace,
+                string_array(args, "required_keys")?.unwrap_or_default(),
+            )
+            .await,
+        )?),
         "run_command_with_secrets" => {
-            let cmd_str = match arguments.get("command").and_then(|v| v.as_str()) {
-                Some(c) => c,
-                None => return make_tool_error(id, "Missing 'command' argument"),
-            };
-            let ns = resolve_ns(&arguments);
-            match client.export_namespace(&ns).await {
-                Ok(secrets) => {
-                    let mut cmd = Command::new("sh");
-                    cmd.arg("-c").arg(cmd_str);
-                    for (k, v) in secrets {
-                        cmd.env(k, v);
-                    }
-                    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-                    match cmd.output() {
-                        Ok(output) => {
-                            let stdout = String::from_utf8_lossy(&output.stdout);
-                            let stderr = String::from_utf8_lossy(&output.stderr);
-                            let code = output.status.code().unwrap_or(-1);
-                            json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "result": {
-                                    "content": [{
-                                        "type": "text",
-                                        "text": format!("Exit Code: {}\nSTDOUT:\n{}\nSTDERR:\n{}", code, stdout, stderr)
-                                    }]
-                                }
-                            })
-                        }
-                        Err(e) => make_tool_error(id, &format!("Failed to execute command: {}", e)),
-                    }
-                }
-                Err(e) => make_tool_error(id, &e.to_string()),
+            let argv = string_array(args, "argv")?;
+            let legacy = args.get("command").and_then(Value::as_str);
+            if argv.is_some() && legacy.is_some() {
+                anyhow::bail!("Supply either argv or command, not both");
             }
+            let command = if let Some(argv) = argv {
+                argv
+            } else {
+                let command = legacy.ok_or_else(|| anyhow::anyhow!("Supply argv or command"))?;
+                #[cfg(unix)]
+                let argv = vec!["sh".into(), "-c".into(), command.into()];
+                #[cfg(windows)]
+                let argv = vec!["cmd".into(), "/C".into(), command.into()];
+                argv
+            };
+            let clean_env = match args.get("clean_env") {
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| anyhow::anyhow!("clean_env must be a boolean"))?,
+                None => true,
+            };
+            let output = run_capture(
+                client,
+                RunOptions {
+                    namespace: namespace.into(),
+                    command,
+                    clean_env,
+                    only: string_array(args, "only")?,
+                    redact: true,
+                },
+            )
+            .await?;
+            Ok(serde_json::to_string(&output)?)
         }
-        other => make_tool_error(id, &format!("Unknown tool: {}", other)),
+        _ => anyhow::bail!("Unknown tool"),
     }
 }
-
-fn make_tool_error(id: Value, msg: &str) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": {
-            "content": [{
-                "type": "text",
-                "text": format!("Error: {}", msg)
-            }],
-            "isError": true
+pub async fn handle_mcp_request(client: &DaemonClient, request: Value) -> Value {
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32600,"message":"Invalid JSON-RPC request"}});
+    }
+    match request.get("method").and_then(Value::as_str) {
+        Some("initialize") => {
+            json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"agentsec","version":env!("CARGO_PKG_VERSION")}}})
         }
-    })
-}
-
-pub fn handle_mcp_request(vault: &crate::store::Vault, req: Value) -> Value {
-    let id = req.get("id").cloned().unwrap_or(Value::Null);
-    let method = match req.get("method").and_then(|v| v.as_str()) {
-        Some(m) => m,
-        None => {
-            return json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": -32600, "message": "Invalid Request: missing method" }
-            });
+        Some("notifications/initialized") => Value::Null,
+        Some("ping") => json!({"jsonrpc":"2.0","id":id,"result":{}}),
+        Some("tools/list") => {
+            json!({"jsonrpc":"2.0","id":id,"result":{"tools":get_tool_definitions()}})
         }
-    };
-    let params = req.get("params").cloned();
-
-    match method {
-        "initialize" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {}
-                },
-                "serverInfo": {
-                    "name": "agentsec",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
+        Some("tools/call") => {
+            let params = request.get("params").unwrap_or(&Value::Null);
+            let Some(name) = params.get("name").and_then(Value::as_str) else {
+                return tool_error(id, "Missing tool name");
+            };
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if !args.is_object() {
+                return tool_error(id, "Arguments must be an object");
             }
-        }),
-        "notifications/initialized" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {}
-        }),
-        "ping" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {}
-        }),
-        "tools/list" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "tools": get_tool_definitions()
-            }
-        }),
-        "tools/call" => {
-            let params = match params {
-                Some(p) => p,
-                None => return json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": { "code": -32602, "message": "Missing params" }
-                }),
-            };
-            let name = match params.get("name").and_then(|v| v.as_str()) {
-                Some(n) => n,
-                None => return json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": { "code": -32602, "message": "Missing tool name" }
-                }),
-            };
-            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-            let default_ns = detect_workspace_namespace(None);
-            let resolve_ns = |args: &Value| -> String {
-                args.get("namespace")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&default_ns)
-                    .to_string()
-            };
-
-            match name {
-                "list_namespaces" => {
-                    let ns = vault.list_namespaces();
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{
-                                "type": "text",
-                                "text": serde_json::to_string_pretty(&ns).unwrap_or_default()
-                            }]
-                        }
-                    })
-                }
-                "list_secrets" => {
-                    let ns = resolve_ns(&arguments);
-                    let secrets = vault.list_secrets(&ns);
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{
-                                "type": "text",
-                                "text": serde_json::to_string_pretty(&secrets).unwrap_or_default()
-                            }]
-                        }
-                    })
-                }
-                "get_secret" => {
-                    let key = match arguments.get("key").and_then(|v| v.as_str()) {
-                        Some(k) => k,
-                        None => return make_tool_error(id, "Missing 'key' argument"),
-                    };
-                    let ns = resolve_ns(&arguments);
-                    match vault.get(&ns, key) {
-                        Some(entry) => json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "content": [{
-                                    "type": "text",
-                                    "text": entry.value.expose_secret()
-                                }]
-                            }
-                        }),
-                        None => make_tool_error(id, &format!("Secret '{}' not found in namespace '{}'", key, ns)),
-                    }
-                }
-                "set_secret" => {
-                    let key = match arguments.get("key").and_then(|v| v.as_str()) {
-                        Some(k) => k,
-                        None => return make_tool_error(id, "Missing 'key' argument"),
-                    };
-                    let value = match arguments.get("value").and_then(|v| v.as_str()) {
-                        Some(v) => v,
-                        None => return make_tool_error(id, "Missing 'value' argument"),
-                    };
-                    let ns = resolve_ns(&arguments);
-                    let desc = arguments.get("description").and_then(|v| v.as_str()).map(String::from);
-                    let ttl = arguments.get("ttl_seconds").and_then(|v| v.as_u64());
-
-                    match vault.set(&ns, key, value, desc, vec![], ttl) {
-                        Ok(meta) => json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "content": [{
-                                    "type": "text",
-                                    "text": format!("Stored secret '{}' in namespace '{}' (preview: {})", meta.name, meta.namespace, meta.masked_preview)
-                                }]
-                            }
-                        }),
-                        Err(e) => make_tool_error(id, &e.to_string()),
-                    }
-                }
-                "delete_secret" => {
-                    let key = match arguments.get("key").and_then(|v| v.as_str()) {
-                        Some(k) => k,
-                        None => return make_tool_error(id, "Missing 'key' argument"),
-                    };
-                    let ns = resolve_ns(&arguments);
-                    match vault.delete(&ns, key) {
-                        Ok(deleted) => json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "content": [{
-                                    "type": "text",
-                                    "text": if deleted {
-                                        format!("Deleted secret '{}' from namespace '{}'", key, ns)
-                                    } else {
-                                        format!("Secret '{}' not found in namespace '{}'", key, ns)
-                                    }
-                                }]
-                            }
-                        }),
-                        Err(e) => make_tool_error(id, &e.to_string()),
-                    }
-                }
-                other => make_tool_error(id, &format!("Unknown tool: {}", other)),
+            match call(client, name, &args).await {
+                Ok(content) => tool_result(id, content),
+                Err(error) => tool_error(id, error),
             }
         }
-        other => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {
-                "code": -32601,
-                "message": format!("Method not found: {}", other)
-            }
-        }),
+        _ => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Method not found"}}),
     }
 }

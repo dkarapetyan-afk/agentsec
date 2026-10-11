@@ -99,8 +99,7 @@ impl AppConfig {
             .or_else(|| std::env::var("AGENTSEC_URL").ok())
             .or_else(|| std::env::var("AGENTSEC_SERVER_URL").ok());
 
-        let token_override = custom_token
-            .or_else(|| std::env::var("AGENTSEC_TOKEN").ok());
+        let token_override = custom_token.or_else(|| std::env::var("AGENTSEC_TOKEN").ok());
 
         Ok(Self {
             config_dir,
@@ -145,15 +144,34 @@ impl AppConfig {
         rand::thread_rng().fill_bytes(&mut bytes);
         let token = hex::encode(bytes);
 
-        fs::write(&self.token_path, &token)
-            .with_context(|| format!("Failed to write token file: {:?}", self.token_path))?;
-
-        #[cfg(unix)]
-        {
-            let _ = fs::set_permissions(&self.token_path, fs::Permissions::from_mode(0o600));
-        }
+        self.save_auth_token(&token)
+            .context("Failed to persist master token")?;
 
         Ok(token)
+    }
+
+    /// Atomically persist a rotated master token with restrictive creation permissions.
+    pub fn save_auth_token(&self, token: &str) -> Result<()> {
+        use std::io::Write;
+        let pending = self.token_path.with_extension("pending");
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&pending)?;
+        let result = (|| -> Result<()> {
+            file.write_all(token.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&pending, &self.token_path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&pending);
+        }
+        result
     }
 
     /// Read the active Cloudflare tunnel URL if recorded

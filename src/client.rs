@@ -5,7 +5,7 @@ use crate::server::{
     ExportNamespaceResponse, HealthResponse, NamespacesResponse, RevokeTokenResponse,
     SecretDetailResponse, SecretsListResponse, SetSecretRequest, StatusResponse, TokenListResponse,
 };
-use crate::token::ClientToken;
+use crate::token::{default_permissions, ClientToken, Permission, TokenMetadata};
 use anyhow::{anyhow, Context, Result};
 use reqwest::{Client, StatusCode};
 use std::collections::HashMap;
@@ -81,7 +81,10 @@ impl DaemonClient {
             .map_err(|e| self.check_connection_error(e))?;
 
         if !resp.status().is_success() {
-            return Err(anyhow!("Health check failed with status: {}", resp.status()));
+            return Err(anyhow!(
+                "Health check failed with status: {}",
+                resp.status()
+            ));
         }
 
         let body: HealthResponse = resp.json().await?;
@@ -303,7 +306,7 @@ impl DaemonClient {
         Ok(body.secrets)
     }
 
-    pub async fn list_client_tokens(&self) -> Result<Vec<ClientToken>> {
+    pub async fn list_client_tokens(&self) -> Result<Vec<TokenMetadata>> {
         let url = format!("{}/v1/tokens", self.base_url);
         let resp = self
             .client
@@ -331,12 +334,34 @@ impl DaemonClient {
         ttl_seconds: Option<u64>,
         namespaces: Vec<String>,
     ) -> Result<ClientToken> {
+        self.create_client_token_with_policy(
+            name,
+            description,
+            ttl_seconds,
+            namespaces,
+            default_permissions(),
+            vec![],
+        )
+        .await
+    }
+
+    pub async fn create_client_token_with_policy(
+        &self,
+        name: &str,
+        description: Option<String>,
+        ttl_seconds: Option<u64>,
+        namespaces: Vec<String>,
+        permissions: Vec<Permission>,
+        keys: Vec<String>,
+    ) -> Result<ClientToken> {
         let url = format!("{}/v1/tokens", self.base_url);
         let req = CreateTokenRequest {
             name: name.to_string(),
             description,
             ttl_seconds,
             namespaces,
+            permissions,
+            keys,
         };
 
         let resp = self
@@ -378,6 +403,122 @@ impl DaemonClient {
 
         let body: RevokeTokenResponse = resp.json().await?;
         Ok(body.revoked)
+    }
+
+    async fn post_json<T: serde::de::DeserializeOwned>(
+        &self,
+        route: &str,
+        payload: impl serde::Serialize,
+    ) -> Result<T> {
+        let response = self
+            .client
+            .post(format!("{}{}", self.base_url, route))
+            .bearer_auth(&self.auth_token)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| self.check_connection_error(e))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let error = response
+                .json::<ErrorResponse>()
+                .await
+                .unwrap_or(ErrorResponse {
+                    error: "Daemon request failed".into(),
+                });
+            return Err(anyhow!("{}: {}", status, error.error));
+        }
+        Ok(response.json().await?)
+    }
+
+    pub async fn inject_secrets(
+        &self,
+        namespace: &str,
+        keys: Option<Vec<String>>,
+    ) -> Result<HashMap<String, String>> {
+        let result: ExportNamespaceResponse = self
+            .post_json(
+                &format!("/v1/inject/{}", urlencoding(namespace)),
+                crate::server::InjectRequest { keys },
+            )
+            .await?;
+        Ok(result.secrets)
+    }
+
+    pub async fn renew_secret(
+        &self,
+        namespace: &str,
+        key: &str,
+        seconds: u64,
+    ) -> Result<SecretMetadata> {
+        self.post_json(
+            &format!(
+                "/v1/secrets/{}/{}/renew",
+                urlencoding(namespace),
+                urlencoding(key)
+            ),
+            crate::server::RenewRequest {
+                ttl_seconds: seconds,
+            },
+        )
+        .await
+    }
+
+    pub async fn renew_client_token(&self, name: &str, seconds: u64) -> Result<TokenMetadata> {
+        self.post_json(
+            &format!("/v1/tokens/{}/renew", urlencoding(name)),
+            crate::server::RenewRequest {
+                ttl_seconds: seconds,
+            },
+        )
+        .await
+    }
+
+    pub async fn rotate_master_token(&self) -> Result<String> {
+        let result: crate::server::RotateTokenResponse = self
+            .post_json("/v1/token/rotate", serde_json::json!({}))
+            .await?;
+        Ok(result.token)
+    }
+
+    pub async fn audit_events(&self, limit: usize) -> Result<Vec<crate::audit::AuditEvent>> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/v1/audit?limit={}",
+                self.base_url,
+                limit.min(1000)
+            ))
+            .bearer_auth(&self.auth_token)
+            .send()
+            .await
+            .map_err(|e| self.check_connection_error(e))?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Audit access denied or unavailable ({})",
+                response.status()
+            ));
+        }
+        Ok(response
+            .json::<crate::server::AuditResponse>()
+            .await?
+            .events)
+    }
+
+    pub async fn mcp_request(&self, payload: serde_json::Value) -> Result<serde_json::Value> {
+        let response = self
+            .client
+            .post(format!("{}/mcp", self.base_url))
+            .bearer_auth(&self.auth_token)
+            .json(&payload)
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await
+            .map_err(|e| self.check_connection_error(e))?;
+        if !response.status().is_success() {
+            anyhow::bail!("MCP request rejected with status {}", response.status());
+        }
+        Ok(response.json().await?)
     }
 }
 

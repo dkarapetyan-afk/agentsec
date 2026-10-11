@@ -20,7 +20,10 @@ pub async fn scan_workspace(
         .with_context(|| format!("Failed to retrieve secrets for namespace '{}'", namespace))?;
 
     if secrets.is_empty() {
-        println!("ℹ️ No secrets found in namespace '{}' to scan for.", namespace);
+        println!(
+            "ℹ️ No secrets found in namespace '{}' to scan for.",
+            namespace
+        );
         return Ok(0);
     }
 

@@ -85,15 +85,24 @@ async fn test_full_daemon_lifecycle_and_features() {
         .expect("Failed to set secret");
 
     // 4. Test Namespaces Listing
-    let namespaces = client.list_namespaces().await.expect("List namespaces failed");
+    let namespaces = client
+        .list_namespaces()
+        .await
+        .expect("List namespaces failed");
     assert!(namespaces.contains(&ns1.to_string()));
     assert!(namespaces.contains(&ns2.to_string()));
 
     // 5. Test Secrets Listing (masked previews)
     let secrets1 = client.list_secrets(ns1).await.expect("List secrets failed");
     assert_eq!(secrets1.len(), 2);
-    let stripe_sec = secrets1.iter().find(|s| s.name == "STRIPE_API_KEY").unwrap();
-    assert_ne!(stripe_sec.masked_preview, "sk_test_51Mz00000000000000000000000000000");
+    let stripe_sec = secrets1
+        .iter()
+        .find(|s| s.name == "STRIPE_API_KEY")
+        .unwrap();
+    assert_ne!(
+        stripe_sec.masked_preview,
+        "sk_test_51Mz00000000000000000000000000000"
+    );
     assert!(stripe_sec.masked_preview.contains("****"));
 
     // 6. Test Secret Detail (get plaintext)
@@ -136,6 +145,7 @@ async fn test_full_daemon_lifecycle_and_features() {
             format!("echo INJECTED_STRIPE=$STRIPE_API_KEY > {:?}", output_file),
         ],
         clean_env: false,
+        ..Default::default()
     };
 
     let exit_code = run_with_secrets(&client, run_opts)
@@ -249,7 +259,10 @@ async fn test_external_vs_local_authentication_and_tunnel_url() {
         .send()
         .await
         .expect("External health request failed");
-    assert_eq!(resp_ext_bad_token.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        resp_ext_bad_token.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
 
     // 4. External /health with valid Bearer token MUST succeed (200)
     let resp_ext_valid = http_client
@@ -332,7 +345,12 @@ async fn test_named_client_tokens_lifecycle_and_scoping() {
     // 2. Create named tokens:
     // a) scoped token restricted to ns_a
     let scoped_token_meta = master_client
-        .create_client_token("scoped-agent", Some("Restricted agent".into()), None, vec![ns_a.to_string()])
+        .create_client_token(
+            "scoped-agent",
+            Some("Restricted agent".into()),
+            None,
+            vec![ns_a.to_string()],
+        )
         .await
         .expect("Failed to create scoped token");
     assert_eq!(scoped_token_meta.name, "scoped-agent");
@@ -341,7 +359,12 @@ async fn test_named_client_tokens_lifecycle_and_scoping() {
 
     // b) unrestricted token
     let global_token_meta = master_client
-        .create_client_token("global-agent", Some("Unrestricted agent".into()), None, vec![])
+        .create_client_token(
+            "global-agent",
+            Some("Unrestricted agent".into()),
+            None,
+            vec![],
+        )
         .await
         .expect("Failed to create global token");
     assert_eq!(global_token_meta.name, "global-agent");
@@ -379,7 +402,10 @@ async fn test_named_client_tokens_lifecycle_and_scoping() {
 
     // Scoped client CANNOT read ns_b (should get 401 Unauthorized)
     let detail_b = scoped_client.get_secret(ns_b, "KEY_B").await;
-    assert!(detail_b.is_err(), "Scoped client must be denied access to ns_b");
+    assert!(
+        detail_b.is_err(),
+        "Scoped client must be denied access to ns_b"
+    );
 
     // 5. Test global token authorization
     let global_config = AppConfig::load_with_overrides(
@@ -408,7 +434,10 @@ async fn test_named_client_tokens_lifecycle_and_scoping() {
     assert!(expired_resp.is_err(), "Expired token must be rejected");
 
     // 7. Revoke scoped token and verify it immediately stops working
-    let revoked = master_client.revoke_client_token("scoped-agent").await.unwrap();
+    let revoked = master_client
+        .revoke_client_token("scoped-agent")
+        .await
+        .unwrap();
     assert!(revoked);
 
     let revoked_resp = scoped_client.get_secret(ns_a, "KEY_A").await;
@@ -421,4 +450,3 @@ async fn test_named_client_tokens_lifecycle_and_scoping() {
     server_handle.abort();
     let _ = fs::remove_dir_all(&temp_dir);
 }
-

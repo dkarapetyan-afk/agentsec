@@ -1,11 +1,16 @@
+pub mod audit;
 pub mod cli;
 pub mod client;
 pub mod config;
 pub mod crypto;
+pub mod doctor;
+pub mod lease;
 pub mod mcp;
 pub mod runner;
 pub mod scanner;
 pub mod secret;
 pub mod server;
+pub mod service;
+pub mod setup;
 pub mod store;
 pub mod token;
