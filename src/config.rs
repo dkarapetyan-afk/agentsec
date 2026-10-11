@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -141,7 +141,7 @@ impl AppConfig {
         }
 
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         let token = hex::encode(bytes);
 
         self.save_auth_token(&token)

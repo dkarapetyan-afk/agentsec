@@ -1,7 +1,7 @@
 use crate::lease::{expires_after, renewed_expiry};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -210,7 +210,7 @@ impl ClientTokenStore {
         }
 
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         let raw_token = hex::encode(bytes);
 
         let masked_preview = format!(
