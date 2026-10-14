@@ -1,8 +1,6 @@
 # agentsec 🔒
 
 [![CI](https://github.com/dkarapetyan-afk/agentsec/actions/workflows/ci.yml/badge.svg)](https://github.com/dkarapetyan-afk/agentsec/actions/workflows/ci.yml)
-[![Crates.io](https://img.shields.io/crates/v/agentsec.svg)](https://crates.io/crates/agentsec)
-[![Documentation](https://docs.rs/agentsec/badge.svg)](https://docs.rs/agentsec)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
 > A secure, namespaced secret management daemon and CLI for AI coding agents and developers.

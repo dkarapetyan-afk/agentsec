@@ -7,7 +7,6 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/dkarapetyan-afk/agentsec"
 homepage = "https://github.com/dkarapetyan-afk/agentsec"
-documentation = "https://docs.rs/agentsec"
 keywords = ["secrets", "security", "ai-agents", "mcp", "credentials"]
 categories = ["command-line-utilities", "cryptography", "development-tools"]
 exclude = [
