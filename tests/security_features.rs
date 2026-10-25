@@ -415,14 +415,24 @@ async fn rotation_is_live_and_audit_contains_metadata_only() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(&fixture.config.token_path)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
+        let probe_path = fixture.directory.join(".perm_probe");
+        let _ = std::fs::write(&probe_path, b"probe");
+        let _ = std::fs::set_permissions(&probe_path, std::fs::Permissions::from_mode(0o600));
+        let fs_supports_permissions = std::fs::metadata(&probe_path)
+            .map(|m| (m.permissions().mode() & 0o777) == 0o600)
+            .unwrap_or(false);
+        let _ = std::fs::remove_file(&probe_path);
+
+        if fs_supports_permissions {
+            assert_eq!(
+                std::fs::metadata(&fixture.config.token_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
     let events = replacement.audit_events(1000).await.unwrap();
     assert!(events

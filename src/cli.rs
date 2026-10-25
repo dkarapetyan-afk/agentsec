@@ -43,6 +43,22 @@ pub struct Cli {
     )]
     pub token: Option<String>,
 
+    #[arg(
+        long,
+        short = 'D',
+        global = true,
+        env = "AGENTSEC_DAEMONLESS",
+        help = "Execute directly against the local encrypted vault without connecting to a daemon"
+    )]
+    pub daemonless: bool,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Require a running daemon and disable automatic fallback to direct vault mode"
+    )]
+    pub require_daemon: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }

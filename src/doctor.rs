@@ -1,4 +1,4 @@
-use crate::client::DaemonClient;
+use crate::backend::ClientBackend;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -14,26 +14,31 @@ pub struct DoctorReport {
     pub checks: Vec<Check>,
 }
 pub async fn diagnose(
-    client: &DaemonClient,
+    client: &(impl Into<ClientBackend> + Clone),
     namespace: &str,
     required_keys: Vec<String>,
 ) -> DoctorReport {
+    let backend: ClientBackend = client.clone().into();
     let mut checks = vec![];
-    let health = client.health().await;
+    let health = backend.health().await;
     checks.push(Check {
         name: "daemon_health".into(),
         passed: health.is_ok(),
-        detail: if health.is_ok() {
+        detail: if backend.is_daemonless() {
+            "Direct / daemonless vault mode (no daemon required)".into()
+        } else if health.is_ok() {
             "Reachable".into()
         } else {
             "Daemon unavailable; check endpoint and daemon status".into()
         },
     });
-    let status = client.status().await;
+    let status = backend.status().await;
     checks.push(Check {
         name: "authentication".into(),
         passed: status.is_ok(),
-        detail: if status.is_ok() {
+        detail: if backend.is_daemonless() {
+            "Direct local master key authentication".into()
+        } else if status.is_ok() {
             "Accepted".into()
         } else {
             "Authentication or connection failed".into()
@@ -51,7 +56,7 @@ pub async fn diagnose(
             "Install the matching binary and restart the daemon after upgrading".into()
         },
     });
-    let secrets = client.list_secrets(namespace).await;
+    let secrets = backend.list_secrets(namespace).await;
     checks.push(Check {
         name: "namespace_access".into(),
         passed: secrets.is_ok(),
@@ -75,7 +80,7 @@ pub async fn diagnose(
             },
         });
     }
-    let mcp = client
+    let mcp = backend
         .mcp_request(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
         .await;
     let expected = crate::mcp::get_tool_definitions();

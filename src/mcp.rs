@@ -1,11 +1,14 @@
-use crate::client::DaemonClient;
+use crate::backend::ClientBackend;
 use crate::config::detect_workspace_namespace;
 use crate::runner::{run_capture, RunOptions};
 use anyhow::Result;
 use serde_json::{json, Value};
+use std::future::Future;
 use std::io::{self, BufRead, Write};
+use std::pin::Pin;
 
-pub async fn run_mcp_server(client: DaemonClient) -> Result<()> {
+pub async fn run_mcp_server(client: impl Into<ClientBackend>) -> Result<()> {
+    let client: ClientBackend = client.into();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     for line in stdin.lock().lines() {
@@ -186,7 +189,7 @@ fn string_array(args: &Value, key: &str) -> Result<Option<Vec<String>>> {
             .collect::<Result<Vec<_>>>()?,
     ))
 }
-async fn call(client: &DaemonClient, name: &str, args: &Value) -> Result<String> {
+async fn call(client: &ClientBackend, name: &str, args: &Value) -> Result<String> {
     let default_ns = detect_workspace_namespace(None);
     let namespace = match args.get("namespace") {
         Some(value) => value
@@ -295,7 +298,15 @@ async fn call(client: &DaemonClient, name: &str, args: &Value) -> Result<String>
         _ => anyhow::bail!("Unknown tool"),
     }
 }
-pub async fn handle_mcp_request(client: &DaemonClient, request: Value) -> Value {
+pub fn handle_mcp_request<'a>(
+    client: &'a (impl Into<ClientBackend> + Clone + Send + Sync),
+    request: Value,
+) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
+    let client: ClientBackend = client.clone().into();
+    Box::pin(async move { handle_mcp_request_inner(&client, request).await })
+}
+
+async fn handle_mcp_request_inner(client: &ClientBackend, request: Value) -> Value {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32600,"message":"Invalid JSON-RPC request"}});

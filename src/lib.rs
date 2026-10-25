@@ -1,8 +1,10 @@
 pub mod audit;
+pub mod backend;
 pub mod cli;
 pub mod client;
 pub mod config;
 pub mod crypto;
+pub mod direct;
 pub mod doctor;
 pub mod lease;
 pub mod mcp;

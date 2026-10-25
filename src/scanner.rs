@@ -1,20 +1,21 @@
-use crate::client::DaemonClient;
+use crate::backend::ClientBackend;
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 pub async fn scan_workspace(
-    client: &DaemonClient,
+    client: &(impl Into<ClientBackend> + Clone),
     namespace: &str,
     target_dir: Option<PathBuf>,
 ) -> Result<usize> {
+    let backend: ClientBackend = client.clone().into();
     let dir = target_dir.unwrap_or_else(|| PathBuf::from("."));
     println!(
         "🔍 Scanning directory {:?} for potential leaks of secrets from namespace '{}'...",
         dir, namespace
     );
 
-    let secrets = client
+    let secrets = backend
         .export_namespace(namespace)
         .await
         .with_context(|| format!("Failed to retrieve secrets for namespace '{}'", namespace))?;

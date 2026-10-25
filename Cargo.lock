@@ -24,6 +24,7 @@ dependencies = [
  "clap",
  "directories",
  "hex",
+ "libc",
  "rand",
  "reqwest",
  "serde",

@@ -27,7 +27,8 @@ Coding agents (Codex, Grok, Gemini, Antigravity, Cursor, Claude Code, Aider, cus
 - **Live Master Rotation**: `token --rotate` immediately replaces the running daemon's master credential without restart.
 - **Diagnostics and Agent Setup**: `doctor` checks version/authentication/namespace/required keys/MCP; `skill install [agent]` (or `setup --agent all`) installs skill bundles for Codex, Grok, Gemini, Antigravity, Claude, Cursor, Aider, or any custom agent.
 - **Daemon Supervision & Monitoring**: `service status`, `service watchdog`, and `service install` provide systemd user services, macOS launchd agents, or periodic cron tasks (`* * * * *` and `@reboot`) with automatic recovery if the daemon is offline.
-- **Model Context Protocol (MCP) Server**: Built-in MCP stdio server (`agentsec mcp`) for plug-and-play integration with AI coding agents.
+- **Daemonless Operations & Auto-Fallback**: Work directly against the local encrypted vault (`vault.enc`) without needing a background daemon running. All CLI subcommands and MCP stdio seamlessly fall back to direct file-locked vault access if the daemon is offline, or can be forced with `--daemonless` (`-D`) or `AGENTSEC_DAEMONLESS=1`. Use `--require-daemon` if a running daemon is mandatory.
+- **Model Context Protocol (MCP) Server**: Built-in MCP stdio server (`agentsec mcp`) for plug-and-play integration with AI coding agents (works in both daemon and daemonless modes).
 - **Workspace Secret Leak Scanner**: Built-in `agentsec scan` checks repository files for stored values of at least six characters; it is not a complete credential detector.
 
 ---
@@ -112,6 +113,23 @@ agentsec delete OPENAI_API_KEY
 # Delete an entire namespace
 agentsec delete --namespace repo:old-project --all-namespace
 ```
+
+### Daemonless & Direct Vault Mode (`--daemonless`, `-D`)
+
+`agentsec` is designed to be resilient and flexible:
+
+- **Automatic Fallback (Default)**: If the background daemon process is not running, CLI commands (`get`, `set`, `list`, `run`, `doctor`, `token`, `mcp`, etc.) automatically fall back to direct local vault mode, using cross-process advisory file locking (`flock`) on `vault.lock` to ensure safe concurrent operations.
+- **Explicit Daemonless Execution**: Pass `--daemonless` (or `-D`) or set `AGENTSEC_DAEMONLESS=1` in your environment to operate directly against the encrypted local vault without attempting to connect to the daemon:
+  ```bash
+  agentsec --daemonless get OPENAI_API_KEY --raw
+  agentsec -D run -- python train.py
+  agentsec -D mcp
+  ```
+- **Strict Daemon Requirement**: If your workflow or security policy requires an active running daemon (for example, to enforce in-memory ephemeral vault policies or remote daemon endpoints), pass `--require-daemon`:
+  ```bash
+  agentsec --require-daemon status
+  ```
+  This will fail with an error if the daemon is offline instead of falling back to direct vault access.
 
 ---
 

@@ -1,5 +1,5 @@
+use agentsec::backend::ClientBackend;
 use agentsec::cli::{Cli, Commands, TokenAction};
-use agentsec::client::DaemonClient;
 use agentsec::config::{detect_workspace_namespace, AppConfig};
 use agentsec::crypto::get_or_create_master_key;
 use agentsec::runner::{run_with_secrets, RunOptions};
@@ -182,29 +182,42 @@ async fn main() -> Result<()> {
         }
 
         Commands::Status => {
-            let client = DaemonClient::new(&config)?;
+            let client =
+                ClientBackend::connect(&config, cli.daemonless, cli.require_daemon).await?;
             match client.status().await {
                 Ok(status) => {
-                    println!("Daemon Status:    ONLINE");
-                    println!("Process ID:       {}", status.pid);
-                    println!("Version:          {}", status.version);
-                    println!("Endpoint:         http://{}:{}", status.host, status.port);
-                    if let Some(ref tunnel) = status.tunnel_url {
-                        println!("Tunnel URL:       {}", tunnel);
-                    }
-                    println!("Uptime:           {}s", status.uptime_seconds);
-                    println!("Namespaces:       {}", status.stats.namespaces_count);
-                    println!("Active Secrets:   {}", status.stats.active_secrets_count);
-                    println!(
-                        "Storage Mode:     {}",
-                        if status.stats.is_ephemeral {
-                            "Ephemeral (RAM only)"
-                        } else {
-                            "Encrypted On-Disk Vault"
+                    if client.is_daemonless() {
+                        println!("Daemon Status:    DAEMONLESS (Direct Local Vault)");
+                        println!("Process ID:       {}", status.pid);
+                        println!("Version:          {}", status.version);
+                        println!("Storage Mode:     Encrypted On-Disk Vault");
+                        println!("Namespaces:       {}", status.stats.namespaces_count);
+                        println!("Active Secrets:   {}", status.stats.active_secrets_count);
+                        if let Some(path) = status.stats.vault_path {
+                            println!("Vault Location:   {}", path);
                         }
-                    );
-                    if let Some(path) = status.stats.vault_path {
-                        println!("Vault Location:   {}", path);
+                    } else {
+                        println!("Daemon Status:    ONLINE");
+                        println!("Process ID:       {}", status.pid);
+                        println!("Version:          {}", status.version);
+                        println!("Endpoint:         http://{}:{}", status.host, status.port);
+                        if let Some(ref tunnel) = status.tunnel_url {
+                            println!("Tunnel URL:       {}", tunnel);
+                        }
+                        println!("Uptime:           {}s", status.uptime_seconds);
+                        println!("Namespaces:       {}", status.stats.namespaces_count);
+                        println!("Active Secrets:   {}", status.stats.active_secrets_count);
+                        println!(
+                            "Storage Mode:     {}",
+                            if status.stats.is_ephemeral {
+                                "Ephemeral (RAM only)"
+                            } else {
+                                "Encrypted On-Disk Vault"
+                            }
+                        );
+                        if let Some(path) = status.stats.vault_path {
+                            println!("Vault Location:   {}", path);
+                        }
                     }
                 }
                 Err(e) => {
@@ -215,7 +228,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Set(args) => {
-            let client = DaemonClient::new(&config)?;
+            let client =
+                ClientBackend::connect(&config, cli.daemonless, cli.require_daemon).await?;
             let namespace = args
                 .namespace
                 .unwrap_or_else(|| detect_workspace_namespace(None));
@@ -244,13 +258,14 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
 
+            let tags = args.tag;
             match client
                 .set_secret(
                     &namespace,
                     &args.key,
                     &value,
                     args.description,
-                    args.tag,
+                    tags,
                     args.ttl,
                 )
                 .await
@@ -280,7 +295,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Get(args) => {
-            let client = DaemonClient::new(&config)?;
+            let client =
+                ClientBackend::connect(&config, cli.daemonless, cli.require_daemon).await?;
             let namespace = args
                 .namespace
                 .unwrap_or_else(|| detect_workspace_namespace(None));
@@ -325,7 +341,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::List(args) => {
-            let client = DaemonClient::new(&config)?;
+            let client =
+                ClientBackend::connect(&config, cli.daemonless, cli.require_daemon).await?;
 
             if args.all_namespaces {
                 match client.list_namespaces().await {
@@ -385,7 +402,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Delete(args) => {
-            let client = DaemonClient::new(&config)?;
+            let client =
+                ClientBackend::connect(&config, cli.daemonless, cli.require_daemon).await?;
             let namespace = args
                 .namespace
                 .unwrap_or_else(|| detect_workspace_namespace(None));
@@ -424,7 +442,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Run(args) => {
-            let client = DaemonClient::new(&config)?;
+            let client =
+                ClientBackend::connect(&config, cli.daemonless, cli.require_daemon).await?;
             let namespace = args
                 .namespace
                 .unwrap_or_else(|| detect_workspace_namespace(None));
@@ -451,11 +470,14 @@ async fn main() -> Result<()> {
         }
 
         Commands::Mcp => {
-            let client = DaemonClient::new(&config)?;
+            let client =
+                ClientBackend::connect(&config, cli.daemonless, cli.require_daemon).await?;
             agentsec::mcp::run_mcp_server(client).await?;
         }
 
         Commands::Token(args) => {
+            let client =
+                ClientBackend::connect(&config, cli.daemonless, cli.require_daemon).await?;
             let action = if let Some(act) = args.action {
                 Some(act)
             } else if let Some(name) = args.create {
@@ -476,7 +498,6 @@ async fn main() -> Result<()> {
 
             match action {
                 Some(TokenAction::Create(create_args)) => {
-                    let client = DaemonClient::new(&config)?;
                     match client
                         .create_client_token_with_policy(
                             &create_args.name,
@@ -522,57 +543,53 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                Some(TokenAction::List) => {
-                    let client = DaemonClient::new(&config)?;
-                    match client.list_client_tokens().await {
-                        Ok(tokens) => {
-                            if tokens.is_empty() {
-                                println!("No named client tokens registered.");
-                                println!("💡 Create one with: agentsec token create <name>");
-                            } else {
-                                println!("Named Client Tokens ({} total):", tokens.len());
+                Some(TokenAction::List) => match client.list_client_tokens().await {
+                    Ok(tokens) => {
+                        if tokens.is_empty() {
+                            println!("No named client tokens registered.");
+                            println!("💡 Create one with: agentsec token create <name>");
+                        } else {
+                            println!("Named Client Tokens ({} total):", tokens.len());
+                            println!(
+                                "{:<20} {:<16} {:<24} {:<24}",
+                                "NAME", "PREVIEW", "NAMESPACES", "EXPIRES"
+                            );
+                            println!("{}", "─".repeat(84));
+                            for t in tokens {
+                                let exp_str = match t.expires_at {
+                                    Some(exp) => exp.format("%Y-%m-%d %H:%M").to_string(),
+                                    None => "Never".to_string(),
+                                };
+                                let ns_str = if t.namespaces.is_empty() {
+                                    "*".to_string()
+                                } else {
+                                    t.namespaces.join(", ")
+                                };
                                 println!(
                                     "{:<20} {:<16} {:<24} {:<24}",
-                                    "NAME", "PREVIEW", "NAMESPACES", "EXPIRES"
+                                    t.name, t.masked_preview, ns_str, exp_str
                                 );
-                                println!("{}", "─".repeat(84));
-                                for t in tokens {
-                                    let exp_str = match t.expires_at {
-                                        Some(exp) => exp.format("%Y-%m-%d %H:%M").to_string(),
-                                        None => "Never".to_string(),
-                                    };
-                                    let ns_str = if t.namespaces.is_empty() {
-                                        "*".to_string()
+                                println!(
+                                    "  permissions: {:?}; keys: {}; TTL left: {}",
+                                    t.permissions,
+                                    if t.keys.is_empty() {
+                                        "*".into()
                                     } else {
-                                        t.namespaces.join(", ")
-                                    };
-                                    println!(
-                                        "{:<20} {:<16} {:<24} {:<24}",
-                                        t.name, t.masked_preview, ns_str, exp_str
-                                    );
-                                    println!(
-                                        "  permissions: {:?}; keys: {}; TTL left: {}",
-                                        t.permissions,
-                                        if t.keys.is_empty() {
-                                            "*".into()
-                                        } else {
-                                            t.keys.join(",")
-                                        },
-                                        t.remaining_ttl_seconds
-                                            .map(|v| format!("{}s", v))
-                                            .unwrap_or_else(|| "Permanent".into())
-                                    );
-                                }
+                                        t.keys.join(",")
+                                    },
+                                    t.remaining_ttl_seconds
+                                        .map(|v| format!("{}s", v))
+                                        .unwrap_or_else(|| "Permanent".into())
+                                );
                             }
                         }
-                        Err(e) => {
-                            eprintln!("❌ Failed to list tokens: {}", e);
-                            std::process::exit(1);
-                        }
                     }
-                }
+                    Err(e) => {
+                        eprintln!("❌ Failed to list tokens: {}", e);
+                        std::process::exit(1);
+                    }
+                },
                 Some(TokenAction::Revoke(revoke_args)) => {
-                    let client = DaemonClient::new(&config)?;
                     match client.revoke_client_token(&revoke_args.name).await {
                         Ok(revoked) => {
                             if revoked {
@@ -591,7 +608,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 Some(TokenAction::Renew(renew_args)) => {
-                    let metadata = DaemonClient::new(&config)?
+                    let metadata = client
                         .renew_client_token(&renew_args.name, renew_args.ttl)
                         .await?;
                     println!(
@@ -602,7 +619,7 @@ async fn main() -> Result<()> {
                 }
                 None => {
                     if args.rotate {
-                        let new_token = DaemonClient::new(&config)?.rotate_master_token().await?;
+                        let new_token = client.rotate_master_token().await?;
                         println!("🔑 Rotated API Auth Token:");
                         println!("{}", new_token);
                     } else {
@@ -615,7 +632,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Scan(args) => {
-            let client = DaemonClient::new(&config)?;
+            let client =
+                ClientBackend::connect(&config, cli.daemonless, cli.require_daemon).await?;
             let namespace = args
                 .namespace
                 .unwrap_or_else(|| detect_workspace_namespace(None));
@@ -627,12 +645,12 @@ async fn main() -> Result<()> {
         }
 
         Commands::Renew(args) => {
+            let client =
+                ClientBackend::connect(&config, cli.daemonless, cli.require_daemon).await?;
             let namespace = args
                 .namespace
                 .unwrap_or_else(|| detect_workspace_namespace(None));
-            let metadata = DaemonClient::new(&config)?
-                .renew_secret(&namespace, &args.key, args.ttl)
-                .await?;
+            let metadata = client.renew_secret(&namespace, &args.key, args.ttl).await?;
             println!(
                 "Renewed '{}' in '{}'; remaining TTL: {}s",
                 metadata.name,
@@ -641,9 +659,9 @@ async fn main() -> Result<()> {
             );
         }
         Commands::Audit(args) => {
-            let events = DaemonClient::new(&config)?
-                .audit_events(args.limit.min(1000))
-                .await?;
+            let client =
+                ClientBackend::connect(&config, cli.daemonless, cli.require_daemon).await?;
+            let events = client.audit_events(args.limit.min(1000)).await?;
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&events)?);
             } else {
@@ -661,15 +679,12 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Doctor(args) => {
+            let client =
+                ClientBackend::connect(&config, cli.daemonless, cli.require_daemon).await?;
             let namespace = args
                 .namespace
                 .unwrap_or_else(|| detect_workspace_namespace(None));
-            let report = agentsec::doctor::diagnose(
-                &DaemonClient::new(&config)?,
-                &namespace,
-                args.required_keys,
-            )
-            .await;
+            let report = agentsec::doctor::diagnose(&client, &namespace, args.required_keys).await;
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {

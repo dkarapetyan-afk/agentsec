@@ -1,4 +1,4 @@
-use crate::client::DaemonClient;
+use crate::backend::ClientBackend;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -210,21 +210,32 @@ fn execute(
         stderr,
     })
 }
-async fn run(client: &DaemonClient, options: RunOptions, capture: bool) -> Result<RunOutput> {
+async fn run(
+    client: &(impl Into<ClientBackend> + Clone),
+    options: RunOptions,
+    capture: bool,
+) -> Result<RunOutput> {
     if options.command.is_empty() {
         return Err(anyhow!("No command specified"));
     }
-    let secrets = client
+    let backend: ClientBackend = client.clone().into();
+    let secrets = backend
         .inject_secrets(&options.namespace, options.only.clone())
         .await?;
     tokio::task::spawn_blocking(move || execute(options, secrets, capture))
         .await
         .context("Command worker failed")?
 }
-pub async fn run_with_secrets(client: &DaemonClient, options: RunOptions) -> Result<i32> {
+pub async fn run_with_secrets(
+    client: &(impl Into<ClientBackend> + Clone),
+    options: RunOptions,
+) -> Result<i32> {
     Ok(run(client, options, false).await?.exit_code)
 }
-pub async fn run_capture(client: &DaemonClient, options: RunOptions) -> Result<RunOutput> {
+pub async fn run_capture(
+    client: &(impl Into<ClientBackend> + Clone),
+    options: RunOptions,
+) -> Result<RunOutput> {
     run(client, options, true).await
 }
 

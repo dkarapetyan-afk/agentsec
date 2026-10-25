@@ -27,6 +27,8 @@ pub struct AppConfig {
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
     pub vault_path: PathBuf,
+    pub vault_lock_path: PathBuf,
+    pub audit_log_path: PathBuf,
     pub master_key_path: PathBuf,
     pub token_path: PathBuf,
     pub socket_path: PathBuf,
@@ -78,6 +80,8 @@ impl AppConfig {
         }
 
         let vault_path = config_dir.join("vault.enc");
+        let vault_lock_path = config_dir.join("vault.lock");
+        let audit_log_path = config_dir.join("audit.log");
         let master_key_path = config_dir.join("master.key");
         let token_path = config_dir.join("token");
         let socket_path = data_dir.join("daemon.sock");
@@ -105,6 +109,8 @@ impl AppConfig {
             config_dir,
             data_dir,
             vault_path,
+            vault_lock_path,
+            audit_log_path,
             master_key_path,
             token_path,
             socket_path,
@@ -172,6 +178,14 @@ impl AppConfig {
             let _ = fs::remove_file(&pending);
         }
         result
+    }
+
+    pub fn rotate_auth_token(&self) -> Result<String> {
+        let mut bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        let token = hex::encode(bytes);
+        self.save_auth_token(&token)?;
+        Ok(token)
     }
 
     /// Read the active Cloudflare tunnel URL if recorded

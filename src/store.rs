@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 #[cfg(unix)]
@@ -28,6 +28,48 @@ struct VaultInner {
 #[derive(Clone)]
 pub struct Vault {
     inner: Arc<RwLock<VaultInner>>,
+}
+
+struct FileLock {
+    #[allow(dead_code)]
+    file: fs::File,
+}
+
+impl FileLock {
+    fn acquire(vault_path: &Path) -> Result<Self> {
+        let lock_path = vault_path.with_extension("lock");
+        let mut options = fs::OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&lock_path)
+            .with_context(|| format!("Failed to open lockfile: {:?}", lock_path))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            let res = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            if res != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+
+        Ok(Self { file })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        let fd = self.file.as_raw_fd();
+        let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
+    }
 }
 
 impl Vault {
@@ -60,6 +102,23 @@ impl Vault {
         Ok(Self {
             inner: Arc::new(RwLock::new(inner)),
         })
+    }
+
+    fn reload_from_disk_locked(inner: &mut VaultInner) -> Result<()> {
+        let path = match &inner.vault_path {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        if path.exists() {
+            let encrypted_bytes = fs::read(path)?;
+            if !encrypted_bytes.is_empty() {
+                let decrypted = decrypt_bytes(&inner.master_key, &encrypted_bytes)?;
+                let loaded_map: HashMap<String, HashMap<String, SecretEntry>> =
+                    serde_json::from_slice(&decrypted)?;
+                inner.data = loaded_map;
+            }
+        }
+        Ok(())
     }
 
     /// Helper to persist the current vault state to encrypted storage on disk
@@ -100,6 +159,11 @@ impl Vault {
             crate::lease::expires_after(seconds)?;
         }
         let mut inner = self.inner.write().unwrap();
+        let _lock = inner
+            .vault_path
+            .as_deref()
+            .and_then(|p| FileLock::acquire(p).ok());
+        let _ = Self::reload_from_disk_locked(&mut inner);
         let ns_map = inner.data.entry(namespace.to_string()).or_default();
 
         let metadata = match ns_map.get_mut(key) {
@@ -120,7 +184,12 @@ impl Vault {
     }
 
     pub fn get(&self, namespace: &str, key: &str) -> Option<SecretEntry> {
+        let vault_path = self.inner.read().unwrap().vault_path.clone();
+        let _lock = vault_path
+            .as_deref()
+            .and_then(|p| FileLock::acquire(p).ok());
         let mut inner = self.inner.write().unwrap();
+        let _ = Self::reload_from_disk_locked(&mut inner);
         if let Some(ns_map) = inner.data.get_mut(namespace) {
             if let Some(entry) = ns_map.get(key) {
                 if entry.is_expired() {
@@ -135,7 +204,12 @@ impl Vault {
     }
 
     pub fn list_secrets(&self, namespace: &str) -> Vec<SecretMetadata> {
+        let vault_path = self.inner.read().unwrap().vault_path.clone();
+        let _lock = vault_path
+            .as_deref()
+            .and_then(|p| FileLock::acquire(p).ok());
         let mut inner = self.inner.write().unwrap();
+        let _ = Self::reload_from_disk_locked(&mut inner);
         let mut expired_keys = Vec::new();
         let mut results = Vec::new();
 
@@ -161,7 +235,8 @@ impl Vault {
     }
 
     pub fn list_namespaces(&self) -> Vec<String> {
-        let inner = self.inner.read().unwrap();
+        let mut inner = self.inner.write().unwrap();
+        let _ = Self::reload_from_disk_locked(&mut inner);
         let mut namespaces: Vec<String> = inner.data.keys().cloned().collect();
         namespaces.sort();
         namespaces
@@ -169,6 +244,11 @@ impl Vault {
 
     pub fn delete(&self, namespace: &str, key: &str) -> Result<bool> {
         let mut inner = self.inner.write().unwrap();
+        let _lock = inner
+            .vault_path
+            .as_deref()
+            .and_then(|p| FileLock::acquire(p).ok());
+        let _ = Self::reload_from_disk_locked(&mut inner);
         let removed = if let Some(ns_map) = inner.data.get_mut(namespace) {
             let res = ns_map.remove(key).is_some();
             if ns_map.is_empty() {
@@ -187,6 +267,11 @@ impl Vault {
 
     pub fn delete_namespace(&self, namespace: &str) -> Result<usize> {
         let mut inner = self.inner.write().unwrap();
+        let _lock = inner
+            .vault_path
+            .as_deref()
+            .and_then(|p| FileLock::acquire(p).ok());
+        let _ = Self::reload_from_disk_locked(&mut inner);
         let count = if let Some(ns_map) = inner.data.remove(namespace) {
             ns_map.len()
         } else {
@@ -200,7 +285,12 @@ impl Vault {
     }
 
     pub fn export_namespace(&self, namespace: &str) -> HashMap<String, String> {
+        let vault_path = self.inner.read().unwrap().vault_path.clone();
+        let _lock = vault_path
+            .as_deref()
+            .and_then(|p| FileLock::acquire(p).ok());
         let mut inner = self.inner.write().unwrap();
+        let _ = Self::reload_from_disk_locked(&mut inner);
         let mut result = HashMap::new();
         let mut expired_keys = Vec::new();
 
@@ -225,7 +315,8 @@ impl Vault {
     }
 
     pub fn stats(&self) -> VaultStats {
-        let inner = self.inner.read().unwrap();
+        let mut inner = self.inner.write().unwrap();
+        let _ = Self::reload_from_disk_locked(&mut inner);
         let namespaces_count = inner.data.len();
         let mut active_secrets_count = 0;
 
@@ -250,6 +341,11 @@ impl Vault {
 
     pub fn renew(&self, namespace: &str, key: &str, seconds: u64) -> Result<SecretMetadata> {
         let mut inner = self.inner.write().unwrap();
+        let _lock = inner
+            .vault_path
+            .as_deref()
+            .and_then(|p| FileLock::acquire(p).ok());
+        let _ = Self::reload_from_disk_locked(&mut inner);
         let entry = inner
             .data
             .get_mut(namespace)
@@ -267,6 +363,11 @@ impl Vault {
 
     pub fn purge_expired(&self) -> Result<usize> {
         let mut inner = self.inner.write().unwrap();
+        let _lock = inner
+            .vault_path
+            .as_deref()
+            .and_then(|p| FileLock::acquire(p).ok());
+        let _ = Self::reload_from_disk_locked(&mut inner);
         let before: usize = inner.data.values().map(HashMap::len).sum();
         let old_namespaces = inner.data.len();
         inner.data.retain(|_, ns| {
