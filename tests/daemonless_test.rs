@@ -190,9 +190,15 @@ async fn test_daemonless_runner_injection_and_redaction() {
         .unwrap();
 
     // Run command that prints the injected env var
+    let command = if cfg!(windows) {
+        vec!["cmd".into(), "/C".into(), "echo var=%MY_SECRET_VAR%".into()]
+    } else {
+        vec!["sh".into(), "-c".into(), "echo var=$MY_SECRET_VAR".into()]
+    };
+
     let options = RunOptions {
         namespace: ns.to_string(),
-        command: vec!["bash".into(), "-c".into(), "echo var=$MY_SECRET_VAR".into()],
+        command,
         clean_env: false,
         only: None,
         redact: true,
