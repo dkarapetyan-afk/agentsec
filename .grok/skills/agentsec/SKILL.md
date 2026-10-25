@@ -1,35 +1,47 @@
 ---
 name: agentsec
 description: >-
-  Store, retrieve, inject, and audit secrets with the agentsec daemon and its MCP tools
-  instead of .env files. Use when handling credentials, API keys, tokens, namespaces,
-  secret rotation, leak scans, or a command that needs injected environment variables,
+  Store, retrieve, inject, and audit secrets with agentsec (daemon or direct daemonless vault)
+  and its MCP tools instead of .env files. Use when handling credentials, API keys, tokens,
+  namespaces, secret rotation, leak scans, or a command that needs injected environment variables,
   and when the user runs /agentsec.
 metadata:
-  short-description: Manage secrets with the agentsec daemon
+  short-description: Manage secrets with agentsec (daemon or daemonless)
 ---
 
 # agentsec
 
-For agentsec 0.2.0 and later. Keep credentials and sensitive device paths in the daemon,
+For agentsec 0.2.2 and later. Keep credentials and sensitive device paths in agentsec,
 not workspace files, command arguments, logs, commits, chat, or dashboard records.
 Templates contain placeholders only. Report key names, namespaces, and masked previews.
 
-## Start and diagnose
+## Daemonless mode and daemon supervision
+
+`agentsec` operates in two modes with seamless auto-fallback:
+- **Automatic Fallback (Default)**: If the background daemon process is offline or unresponsive,
+  CLI subcommands (`get`, `set`, `list`, `run`, `doctor`, `token`, `mcp`, etc.) automatically
+  operate directly on the local encrypted vault (`vault.enc`) using cross-process advisory locking
+  (`vault.lock`). A running daemon is NOT required for local operations or CLI/MCP execution.
+- **Explicit Daemonless Mode**: Pass `--daemonless` (`-D`) or set `AGENTSEC_DAEMONLESS=1` in your
+  environment to skip daemon discovery and access the local vault directly.
+- **Strict Daemon Requirement**: Pass `--require-daemon` if an active daemon is mandatory (e.g.
+  when using ephemeral RAM-only vaults or connecting to a custom/remote daemon URL).
 
 Run `agentsec status` before operations; capture its output if it includes protected paths.
-If offline, start `agentsec daemon` in the background and wait until online.
-Use `daemon --ephemeral` only when the user requests secrets that disappear on exit.
+In direct mode, status reports `DAEMONLESS (Direct Local Vault)`.
+If a background daemon is desired (e.g. for ephemeral RAM-only vaults with `daemon --ephemeral` or
+shared listening socket), start `agentsec daemon` in the background and wait until online.
 Ephemeral secret values and audit events are RAM-only; configuration and auth files still exist.
 
 Use `agentsec doctor [--require KEY1,KEY2] [--json]` for authentication, version,
-namespace, required-key metadata, and HTTP MCP discovery checks. Exit 1 means a failed
+namespace, required-key metadata, and MCP discovery checks. Exit 1 means a failed
 check. Upgrade both CLI and daemon to the same version and restart after upgrading.
 Doctor tests read permission; a deliberately run-only token will fail namespace inspection.
 
 Prefer connected agentsec MCP tools. Discover their actual schema before calling.
 Otherwise resolve `agentsec` in PATH, then `/usr/local/bin/agentsec`, then
-`$HOME/.cargo/bin/agentsec`. Do not start duplicate MCP servers.
+`$HOME/.cargo/bin/agentsec`. Built-in MCP stdio (`agentsec mcp` or `agentsec -D mcp`)
+works in both daemon and daemonless modes. Do not start duplicate MCP servers.
 
 ## Namespace and permissions
 

@@ -1,14 +1,14 @@
 # agentsec 0.2 CLI reference
 
-Global: `-c/--config-dir`, `--host`, `-p/--port`, `--url`, `--token`.
+Global: `-c/--config-dir`, `--host`, `-p/--port`, `--url`, `--token`, `-D/--daemonless`, `--require-daemon`.
 Environment overrides: AGENTSEC_CONFIG_DIR, AGENTSEC_HOST, AGENTSEC_PORT,
-AGENTSEC_URL (also AGENTSEC_SERVER_URL), AGENTSEC_TOKEN.
+AGENTSEC_URL (also AGENTSEC_SERVER_URL), AGENTSEC_TOKEN, AGENTSEC_DAEMONLESS.
 Use injected AGENTSEC_TOKEN rather than putting bearer values in arguments.
 
 | Command | Options / behavior |
 | --- | --- |
 | `daemon` | `--ephemeral` keeps secret values and audit events in RAM; configuration/auth files still exist |
-| `status` | Online status, version, process metadata; owner output may contain protected storage paths |
+| `status` | Reports ONLINE (daemon) or DAEMONLESS (direct vault), version, storage metrics |
 | `set KEY` | Stdin/hidden input; `-n`, `-d`, repeatable `-t`, `--ttl 1..31536000` |
 | `get KEY` | Masked inspection; `-n`; `--raw` is for privately captured process consumption only |
 | `list` | Masked keys; `-n`; `--all-namespaces` filters to allowed namespaces |
@@ -19,7 +19,7 @@ Use injected AGENTSEC_TOKEN rather than putting bearer values in arguments.
 | `audit` | Admin only; `--limit` (max 1000), `--json`; recent metadata newest first |
 | `doctor` | `-n`, `--require KEY1,KEY2`, `--json`; exit 1 if any check fails |
 | `setup` | `--agent all\|codex\|grok\|gemini`, `--dry-run`; skill bundles only, not MCP configuration |
-| `mcp` | Stdio adapter; shared permission enforcement with HTTP MCP |
+| `mcp` | Stdio adapter; operates in both daemon and daemonless direct modes |
 
 ## Tokens (owner/admin only)
 

@@ -1,8 +1,11 @@
 # agentsec 0.2 architecture
 
-CLI and stdio MCP call the authenticated REST daemon. HTTP MCP forwards requests
-through that same implementation using the original caller credential, not the
-master. REST gates each operation by permission, namespace, and exact key scope.
+CLI and stdio MCP dispatch via `ClientBackend`: either `DaemonClient` (calling the
+authenticated REST daemon over loopback/network) or `DirectClient` (operating directly
+on the local encrypted vault `vault.enc` using cross-process advisory file locking
+`vault.lock` and automatic reload). HTTP MCP forwards requests through that same
+implementation using the original caller credential. Operations are gated by permission,
+namespace, and exact key scope.
 
 - Read: list metadata, retrieve raw values, export permitted values.
 - Write: set/delete/renew permitted secrets; namespace deletion is unavailable to
