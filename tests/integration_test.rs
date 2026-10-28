@@ -20,7 +20,9 @@ async fn test_full_daemon_lifecycle_and_features() {
     let config = AppConfig::load(Some(temp_dir.clone()), Some(port)).unwrap();
     let auth_token = config.get_or_create_auth_token().unwrap();
     let master_key = MasterKey::generate();
-    let vault = Vault::new(master_key, Some(config.vault_path.clone())).unwrap();
+    let vault = Vault::new(master_key, Some(config.vault_path.clone()))
+        .await
+        .unwrap();
 
     // Spawn server in background
     let server_config = config.clone();
@@ -215,7 +217,9 @@ async fn test_external_vs_local_authentication_and_tunnel_url() {
     let config = AppConfig::load(Some(temp_dir.clone()), Some(port)).unwrap();
     let auth_token = config.get_or_create_auth_token().unwrap();
     let master_key = MasterKey::generate();
-    let vault = Vault::new(master_key, Some(config.vault_path.clone())).unwrap();
+    let vault = Vault::new(master_key, Some(config.vault_path.clone()))
+        .await
+        .unwrap();
 
     // Write a mock tunnel URL
     let mock_tunnel_url = "https://agentsec-test-demo.trycloudflare.com";
@@ -314,7 +318,9 @@ async fn test_named_client_tokens_lifecycle_and_scoping() {
     let config = AppConfig::load(Some(temp_dir.clone()), Some(port)).unwrap();
     let master_token = config.get_or_create_auth_token().unwrap();
     let master_key = MasterKey::generate();
-    let vault = Vault::new(master_key, Some(config.vault_path.clone())).unwrap();
+    let vault = Vault::new(master_key, Some(config.vault_path.clone()))
+        .await
+        .unwrap();
 
     // Spawn server
     let server_config = config.clone();

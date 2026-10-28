@@ -71,6 +71,11 @@ pub enum Commands {
     #[command(about = "Check daemon connection, process status, and storage metrics")]
     Status,
 
+    #[command(
+        about = "Migrate an offline legacy vault to encrypted namespace files; stop older clients first"
+    )]
+    Migrate,
+
     #[command(about = "Set or update a secret under a namespace")]
     Set(SetArgs),
 

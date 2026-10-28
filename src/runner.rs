@@ -3,10 +3,13 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    io::{self, Read, Write},
-    process::{Command, Stdio},
-    thread,
+    io,
+    pin::Pin,
+    process::Stdio,
+    task::{Context as TaskContext, Poll},
 };
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::process::Command;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(Clone)]
@@ -99,38 +102,47 @@ impl LimitedBuffer {
         String::from_utf8_lossy(&self.bytes).into_owned()
     }
 }
-impl Write for LimitedBuffer {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+impl AsyncWrite for LimitedBuffer {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let count = bytes
             .len()
             .min((1024 * 1024usize).saturating_sub(self.bytes.len()));
         self.bytes.extend_from_slice(&bytes[..count]);
         self.truncated |= count < bytes.len();
-        Ok(bytes.len())
+        Poll::Ready(Ok(bytes.len()))
     }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
-fn copy_filtered(
-    mut reader: impl Read,
-    mut writer: impl Write,
+async fn copy_filtered(
+    mut reader: impl AsyncRead + Unpin,
+    mut writer: impl AsyncWrite + Unpin,
     values: Vec<String>,
 ) -> io::Result<()> {
     let mut redactor = Redactor::new(values);
     let mut bytes = [0u8; 8192];
     loop {
-        let count = reader.read(&mut bytes)?;
+        let count = reader.read(&mut bytes).await?;
         if count == 0 {
             break;
         }
-        writer.write_all(&redactor.feed(&bytes[..count], false))?;
-        writer.flush()?;
+        writer
+            .write_all(&redactor.feed(&bytes[..count], false))
+            .await?;
+        writer.flush().await?;
     }
-    writer.write_all(&redactor.feed(&[], true))?;
-    writer.flush()
+    writer.write_all(&redactor.feed(&[], true)).await?;
+    writer.flush().await
 }
-fn execute(
+async fn execute(
     options: RunOptions,
     secrets: HashMap<String, String>,
     capture: bool,
@@ -173,37 +185,38 @@ fn execute(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().context("Failed to start child command")?;
+    command.kill_on_drop(true);
+    // Only fork/exec runs on the blocking pool. No worker, vault reference, or
+    // storage lock is retained for the lifetime of the child process.
+    let mut child = tokio::task::spawn_blocking(move || command.spawn())
+        .await
+        .context("Process startup worker failed")?
+        .context("Failed to start child command")?;
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let stdout_values = values.clone();
-    let stdout_task = thread::spawn(move || -> io::Result<String> {
+    let stdout_task = async move {
         if capture {
             let mut output = LimitedBuffer::new();
-            copy_filtered(stdout, &mut output, stdout_values)?;
-            Ok(output.finish())
+            copy_filtered(stdout, &mut output, stdout_values).await?;
+            Ok::<_, io::Error>(output.finish())
         } else {
-            copy_filtered(stdout, io::stdout().lock(), stdout_values)?;
+            copy_filtered(stdout, tokio::io::stdout(), stdout_values).await?;
             Ok(String::new())
         }
-    });
-    let stderr_task = thread::spawn(move || -> io::Result<String> {
+    };
+    let stderr_task = async move {
         if capture {
             let mut output = LimitedBuffer::new();
-            copy_filtered(stderr, &mut output, values)?;
-            Ok(output.finish())
+            copy_filtered(stderr, &mut output, values).await?;
+            Ok::<_, io::Error>(output.finish())
         } else {
-            copy_filtered(stderr, io::stderr().lock(), values)?;
+            copy_filtered(stderr, tokio::io::stderr(), values).await?;
             Ok(String::new())
         }
-    });
-    let status = child.wait().context("Failed to wait for child command")?;
-    let stdout = stdout_task
-        .join()
-        .map_err(|_| anyhow!("Output reader failed"))??;
-    let stderr = stderr_task
-        .join()
-        .map_err(|_| anyhow!("Error-output reader failed"))??;
+    };
+    let (status, stdout, stderr) = tokio::try_join!(child.wait(), stdout_task, stderr_task)
+        .context("Child process or output stream failed")?;
     Ok(RunOutput {
         exit_code: status.code().unwrap_or(1),
         stdout,
@@ -222,9 +235,8 @@ async fn run(
     let secrets = backend
         .inject_secrets(&options.namespace, options.only.clone())
         .await?;
-    tokio::task::spawn_blocking(move || execute(options, secrets, capture))
-        .await
-        .context("Command worker failed")?
+    drop(backend);
+    execute(options, secrets, capture).await
 }
 pub async fn run_with_secrets(
     client: &(impl Into<ClientBackend> + Clone),

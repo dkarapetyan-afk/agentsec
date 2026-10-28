@@ -27,7 +27,9 @@ impl Fixture {
         config.custom_token = None;
         config.custom_url = None;
         let token = config.get_or_create_auth_token().unwrap();
-        let vault = Vault::new(MasterKey::generate(), Some(config.vault_path.clone())).unwrap();
+        let vault = Vault::new(MasterKey::generate(), Some(config.vault_path.clone()))
+            .await
+            .unwrap();
         let (server_config, server_vault) = (config.clone(), vault.clone());
         let task = tokio::spawn(async move {
             start_server(server_config, server_vault, token)
@@ -374,8 +376,8 @@ async fn leases_are_bounded_renewable_and_proactively_purged() {
     let expiring_client = fixture.client_for(&expiring.token);
     assert!(expiring_client.status().await.is_ok());
     tokio::time::sleep(Duration::from_millis(2200)).await;
-    assert_eq!(fixture.vault.stats().active_secrets_count, 2);
-    assert_eq!(fixture.vault.stats().namespaces_count, 1);
+    assert_eq!(fixture.vault.stats().await.active_secrets_count, 2);
+    assert_eq!(fixture.vault.stats().await.namespaces_count, 1);
     assert!(expiring_client.status().await.is_err());
     let persisted = std::fs::read_to_string(fixture.config.client_tokens_path.clone()).unwrap();
     assert!(!persisted.contains("expires-without-read"));

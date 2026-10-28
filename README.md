@@ -27,6 +27,7 @@ Coding agents (Codex, Grok, Gemini, Antigravity, Cursor, Claude Code, Aider, cus
 - **Live Master Rotation**: `token --rotate` immediately replaces the running daemon's master credential without restart.
 - **Diagnostics and Agent Setup**: `doctor` checks version/authentication/namespace/required keys/MCP; `skill install [agent]` (or `setup --agent all`) installs skill bundles for Codex, Grok, Gemini, Antigravity, Claude, Cursor, Aider, or any custom agent.
 - **Daemon Supervision & Monitoring**: `service status`, `service watchdog`, and `service install` provide systemd user services, macOS launchd agents, or periodic cron tasks (`* * * * *` and `@reboot`) with automatic recovery if the daemon is offline.
+- **Independent Concurrent Operations**: Async HTTP/MCP handlers and per-namespace encrypted files eliminate the vault-wide lock. Namespace contention waits asynchronously. Child processes release vault access before startup and use async waits and output streams, holding no storage worker during execution. MCP stdio reserves separate capacity for 32 commands and 64 ordinary operations; overload returns a busy error.
 - **Daemonless Operations & Auto-Fallback**: Work directly against the local encrypted vault (`vault.enc`) without needing a background daemon running. All CLI subcommands and MCP stdio seamlessly fall back to direct file-locked vault access if the daemon is offline, or can be forced with `--daemonless` (`-D`) or `AGENTSEC_DAEMONLESS=1`. Use `--require-daemon` if a running daemon is mandatory.
 - **Model Context Protocol (MCP) Server**: Built-in MCP stdio server (`agentsec mcp`) for plug-and-play integration with AI coding agents (works in both daemon and daemonless modes).
 - **Workspace Secret Leak Scanner**: Built-in `agentsec scan` checks repository files for stored values of at least six characters; it is not a complete credential detector.
@@ -51,6 +52,19 @@ To run in ephemeral RAM-only mode (secrets exist only as long as the daemon is r
 agentsec daemon --ephemeral
 ```
 
+### Upgrade from a pre-0.3 vault
+
+Stop older agentsec processes before the one-time conversion:
+
+```bash
+agentsec migrate
+```
+
+The encrypted original remains at `vault.legacy.enc`; interrupted imports can be
+resumed with the same command. The new namespace files preserve secret values,
+metadata, and expiry. Restart the daemon and MCP adapters with the new binary.
+Older binaries cannot open the namespace directory. No vault-wide lock is used.
+
 ### 3. Check Daemon Status
 ```bash
 agentsec status
@@ -58,7 +72,7 @@ agentsec status
 ```text
 Daemon Status:    ONLINE
 Process ID:       12345
-Version:          0.2.0
+Version:          0.3.0
 Endpoint:         http://127.0.0.1:52199
 Uptime:           42s
 Namespaces:       2
@@ -118,7 +132,7 @@ agentsec delete --namespace repo:old-project --all-namespace
 
 `agentsec` is designed to be resilient and flexible:
 
-- **Automatic Fallback (Default)**: If the background daemon process is not running, CLI commands (`get`, `set`, `list`, `run`, `doctor`, `token`, `mcp`, etc.) automatically fall back to direct local vault mode, using cross-process advisory file locking (`flock`) on `vault.lock` to ensure safe concurrent operations.
+- **Automatic Fallback (Default)**: If the background daemon process is not running, CLI commands (`get`, `set`, `list`, `run`, `doctor`, `token`, `mcp`, etc.) automatically fall back to direct local vault mode, using individual namespace file locks with nonblocking acquisition and async retry. Unrelated namespaces never share a vault lock.
 - **Explicit Daemonless Execution**: Pass `--daemonless` (or `-D`) or set `AGENTSEC_DAEMONLESS=1` in your environment to operate directly against the encrypted local vault without attempting to connect to the daemon:
   ```bash
   agentsec --daemonless get OPENAI_API_KEY --raw
@@ -332,11 +346,11 @@ flowchart LR
     A["Agent / CLI"] -->|"Loopback HTTP / Bearer Auth"| D["agentsec daemon"]
     D --> S["RAM Secret Store\n(Zeroize on Drop)"]
     S --> C["ChaCha20-Poly1305\n(random 256-bit master key)"]
-    C --> F["~/.config/agentsec/vault.enc\n(chmod 0600)"]
+    C --> F["~/.config/agentsec/vault.enc/\n(encrypted namespace files)"]
     D -->|"Injects in RAM env"| P["Subprocess (`npm test`, `cargo run`)"]
 ```
 
-1. **Storage At Rest**: Secrets are saved in `~/.config/agentsec/vault.enc` encrypted using ChaCha20-Poly1305. The master key is derived or generated with 256 bits of entropy and stored with `0600` permissions.
+1. **Storage At Rest**: Secrets are saved as separate encrypted namespace files inside `~/.config/agentsec/vault.enc/`, using ChaCha20-Poly1305 and private directory/file permissions. The master key is derived or generated with 256 bits of entropy and stored with `0600` permissions.
 2. **Storage In Transit**: Daemon defaults to localhost (`127.0.0.1`) with a cryptographically random bearer token. Host overrides are supported; use TLS and scoped tokens for remote access.
 3. **Storage In Memory**: Protected secret wrappers implement `zeroize::ZeroizeOnDrop`; this does not guarantee scrubbing of every temporary copy or child environment.
 4. **Leak Prevention**: Redacted string formatting (`[SECRET_REDACTED]`) prevents accidental output in debug logs.

@@ -1,38 +1,88 @@
 use crate::backend::ClientBackend;
 use crate::config::detect_workspace_namespace;
 use crate::runner::{run_capture, RunOptions};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::future::Future;
-use std::io::{self, BufRead, Write};
 use std::pin::Pin;
+use std::sync::Arc;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 pub async fn run_mcp_server(client: impl Into<ClientBackend>) -> Result<()> {
-    let client: ClientBackend = client.into();
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let request = match serde_json::from_str::<Value>(&line) {
-            Ok(value) => value,
-            Err(_) => {
-                writeln!(
-                    stdout,
-                    "{}",
-                    json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Invalid JSON"}})
-                )?;
-                stdout.flush()?;
-                continue;
+    serve_mcp(
+        client.into(),
+        BufReader::new(tokio::io::stdin()),
+        tokio::io::stdout(),
+    )
+    .await
+}
+
+// Responses have one writer; request IDs allow independent requests to finish out of order.
+// Separate command and operation budgets keep long-running children from blocking storage requests.
+pub async fn serve_mcp(
+    client: ClientBackend,
+    reader: impl AsyncBufRead + Unpin,
+    mut writer: impl AsyncWrite + Unpin,
+) -> Result<()> {
+    let commands = Arc::new(Semaphore::new(32));
+    let operations = Arc::new(Semaphore::new(64));
+    let mut lines = reader.lines();
+    let mut requests = JoinSet::new();
+    let mut eof = false;
+    loop {
+        tokio::select! {
+            line = lines.next_line(), if !eof => {
+                let Some(line) = line? else {
+                    eof = true;
+                    continue;
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let request = match serde_json::from_str::<Value>(&line) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        write_response(&mut writer, &json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Invalid JSON"}})).await?;
+                        continue;
+                    }
+                };
+                let is_command = request.get("method").and_then(Value::as_str) == Some("tools/call")
+                    && request.pointer("/params/name").and_then(Value::as_str) == Some("run_command_with_secrets");
+                let budget = if is_command { &commands } else { &operations };
+                let permit = match budget.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        if let Some(id) = request.get("id") {
+                            write_response(&mut writer, &json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"Too many concurrent requests of this kind; retry later"}})).await?;
+                        }
+                        continue;
+                    }
+                };
+                let client = client.clone();
+                requests.spawn(async move {
+                    let _permit = permit;
+                    handle_mcp_request(&client, request).await
+                });
             }
-        };
-        let response = handle_mcp_request(&client, request).await;
-        if !response.is_null() {
-            writeln!(stdout, "{}", response)?;
-            stdout.flush()?;
+            result = requests.join_next(), if !requests.is_empty() => {
+                let response = result.context("MCP request worker missing")?
+                    .context("MCP request worker failed")?;
+                write_response(&mut writer, &response).await?;
+            }
+            else => break,
         }
+    }
+    Ok(())
+}
+
+async fn write_response(writer: &mut (impl AsyncWrite + Unpin), response: &Value) -> Result<()> {
+    if !response.is_null() {
+        let mut line = serde_json::to_vec(response)?;
+        line.push(b'\n');
+        writer.write_all(&line).await?;
+        writer.flush().await?;
     }
     Ok(())
 }
@@ -190,7 +240,11 @@ fn string_array(args: &Value, key: &str) -> Result<Option<Vec<String>>> {
     ))
 }
 async fn call(client: &ClientBackend, name: &str, args: &Value) -> Result<String> {
-    let default_ns = detect_workspace_namespace(None);
+    let default_ns = if args.get("namespace").is_none() {
+        tokio::task::spawn_blocking(|| detect_workspace_namespace(None)).await?
+    } else {
+        String::new()
+    };
     let namespace = match args.get("namespace") {
         Some(value) => value
             .as_str()

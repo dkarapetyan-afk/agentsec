@@ -12,7 +12,7 @@ use std::io::{self, IsTerminal, Read};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
                 Some(config.vault_path.clone())
             };
 
-            let vault = Vault::new(master_key, vault_path.clone())?;
+            let vault = Vault::new(master_key, vault_path.clone()).await?;
             let token = config.get_or_create_auth_token()?;
             let tunnel_url = config.read_tunnel_url();
 
@@ -179,6 +179,12 @@ async fn main() -> Result<()> {
             println!("╚══════════════════════════════════════════════════════════╝");
 
             start_server(config, vault, token).await?;
+        }
+
+        Commands::Migrate => {
+            let master_key = get_or_create_master_key(&config.master_key_path)?;
+            let count = Vault::migrate_legacy(master_key, config.vault_path).await?;
+            println!("Migrated {count} namespaces; the encrypted legacy backup was preserved.");
         }
 
         Commands::Status => {

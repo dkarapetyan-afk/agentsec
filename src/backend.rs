@@ -49,7 +49,7 @@ impl ClientBackend {
             .unwrap_or(false);
 
         if daemonless || env_daemonless {
-            return Ok(Self::Direct(Box::new(DirectClient::new(config)?)));
+            return Ok(Self::Direct(Box::new(DirectClient::connect(config).await?)));
         }
 
         // If an explicit custom/remote URL is set, always use DaemonClient
@@ -72,14 +72,14 @@ impl ClientBackend {
                     ))
                 } else {
                     // Graceful auto-fallback to direct local vault mode
-                    Ok(Self::Direct(Box::new(DirectClient::new(config)?)))
+                    Ok(Self::Direct(Box::new(DirectClient::connect(config).await?)))
                 }
             }
             Err(e) => {
                 if require_daemon {
                     Err(e)
                 } else {
-                    Ok(Self::Direct(Box::new(DirectClient::new(config)?)))
+                    Ok(Self::Direct(Box::new(DirectClient::connect(config).await?)))
                 }
             }
         }

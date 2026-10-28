@@ -5,7 +5,7 @@ use crate::secret::SecretMetadata;
 use crate::server::{HealthResponse, SecretDetailResponse, StatusResponse};
 use crate::store::Vault;
 use crate::token::{ClientToken, ClientTokenStore, Permission, TokenMetadata};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use std::collections::HashMap;
 
@@ -18,11 +18,18 @@ pub struct DirectClient {
 }
 
 impl DirectClient {
-    pub fn new(config: &AppConfig) -> Result<Self> {
-        let master_key = get_or_create_master_key(&config.master_key_path)?;
-        let vault = Vault::new(master_key, Some(config.vault_path.clone()))?;
-        let audit = AuditLog::new(Some(config.audit_log_path.clone()));
-
+    pub async fn new(config: &AppConfig) -> Result<Self> {
+        let key_path = config.master_key_path.clone();
+        let audit_path = config.audit_log_path.clone();
+        let (master_key, audit) = tokio::task::spawn_blocking(move || {
+            anyhow::Ok((
+                get_or_create_master_key(&key_path)?,
+                AuditLog::new(Some(audit_path)),
+            ))
+        })
+        .await
+        .context("Vault initialization worker failed")??;
+        let vault = Vault::new(master_key, Some(config.vault_path.clone())).await?;
         Ok(Self {
             vault,
             config: config.clone(),
@@ -31,9 +38,23 @@ impl DirectClient {
         })
     }
 
-    pub fn with_ephemeral_vault(config: &AppConfig) -> Result<Self> {
+    pub async fn connect(config: &AppConfig) -> Result<Self> {
+        Self::new(config).await
+    }
+
+    async fn blocking<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(Self) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let client = self.clone();
+        tokio::task::spawn_blocking(move || operation(client))
+            .await
+            .context("Local vault worker failed")?
+    }
+
+    pub async fn with_ephemeral_vault(config: &AppConfig) -> Result<Self> {
         let master_key = crate::crypto::MasterKey::generate();
-        let vault = Vault::new(master_key, None)?;
+        let vault = Vault::new(master_key, None).await?;
         let audit = AuditLog::new(None);
 
         Ok(Self {
@@ -61,7 +82,7 @@ impl DirectClient {
     }
 
     pub async fn status(&self) -> Result<StatusResponse> {
-        let stats = self.vault.stats();
+        let stats = self.vault.try_stats().await?;
         Ok(StatusResponse {
             pid: std::process::id(),
             version: env!("CARGO_PKG_VERSION").into(),
@@ -75,44 +96,63 @@ impl DirectClient {
     }
 
     pub async fn list_namespaces(&self) -> Result<Vec<String>> {
-        let namespaces = self.vault.list_namespaces();
+        let namespaces = self.vault.try_list_namespaces().await?;
         let _ = self
             .audit
-            .record("cli-direct", "list_namespaces", None, None, "success");
+            .record_async("cli-direct", "list_namespaces", None, None, "success")
+            .await;
         Ok(namespaces)
     }
 
     pub async fn list_secrets(&self, namespace: &str) -> Result<Vec<SecretMetadata>> {
-        let secrets = self.vault.list_secrets(namespace);
-        let _ = self.audit.record(
-            "cli-direct",
-            "list_secrets",
-            Some(namespace),
-            None,
-            "success",
-        );
+        let namespace = namespace.to_owned();
+
+        let secrets = self.vault.try_list_secrets(&namespace).await?;
+        let _ = self
+            .audit
+            .record_async(
+                "cli-direct",
+                "list_secrets",
+                Some(&namespace),
+                None,
+                "success",
+            )
+            .await;
         Ok(secrets)
     }
 
     pub async fn get_secret(&self, namespace: &str, key: &str) -> Result<SecretDetailResponse> {
-        let entry = self.vault.get(namespace, key).ok_or_else(|| {
-            let _ = self.audit.record(
+        let namespace = namespace.to_owned();
+        let key = key.to_owned();
+
+        let Some(entry) = self.vault.try_get(&namespace, &key).await? else {
+            let _ = self
+                .audit
+                .record_async(
+                    "cli-direct",
+                    "get_secret",
+                    Some(&namespace),
+                    Some(&key),
+                    "not_found",
+                )
+                .await;
+            return Err(anyhow!(
+                "Secret '{}' not found in namespace '{}'",
+                key,
+                namespace
+            ));
+        };
+
+        let _ = self
+            .audit
+            .record_async(
                 "cli-direct",
                 "get_secret",
-                Some(namespace),
-                Some(key),
-                "not_found",
-            );
-            anyhow!("Secret '{}' not found in namespace '{}'", key, namespace)
-        })?;
-
-        let _ = self.audit.record(
-            "cli-direct",
-            "get_secret",
-            Some(namespace),
-            Some(key),
-            "success",
-        );
+                Some(&namespace),
+                Some(&key),
+                "success",
+            )
+            .await;
         Ok(SecretDetailResponse {
             name: entry.metadata.name.clone(),
             namespace: entry.metadata.namespace.clone(),
@@ -130,53 +170,77 @@ impl DirectClient {
         tags: Vec<String>,
         ttl_seconds: Option<u64>,
     ) -> Result<SecretMetadata> {
+        let namespace = namespace.to_owned();
+        let key = key.to_owned();
+        let value = value.to_owned();
+
         let meta = self
             .vault
-            .set(namespace, key, value, description, tags, ttl_seconds)?;
-        let _ = self.audit.record(
-            "cli-direct",
-            "set_secret",
-            Some(namespace),
-            Some(key),
-            "success",
-        );
+            .set(&namespace, &key, &value, description, tags, ttl_seconds)
+            .await?;
+        let _ = self
+            .audit
+            .record_async(
+                "cli-direct",
+                "set_secret",
+                Some(&namespace),
+                Some(&key),
+                "success",
+            )
+            .await;
         Ok(meta)
     }
 
     pub async fn delete_secret(&self, namespace: &str, key: &str) -> Result<bool> {
-        let deleted = self.vault.delete(namespace, key)?;
+        let namespace = namespace.to_owned();
+        let key = key.to_owned();
+
+        let deleted = self.vault.delete(&namespace, &key).await?;
         let outcome = if deleted { "success" } else { "not_found" };
-        let _ = self.audit.record(
-            "cli-direct",
-            "delete_secret",
-            Some(namespace),
-            Some(key),
-            outcome,
-        );
+        let _ = self
+            .audit
+            .record_async(
+                "cli-direct",
+                "delete_secret",
+                Some(&namespace),
+                Some(&key),
+                outcome,
+            )
+            .await;
         Ok(deleted)
     }
 
     pub async fn delete_namespace(&self, namespace: &str) -> Result<usize> {
-        let count = self.vault.delete_namespace(namespace)?;
-        let _ = self.audit.record(
-            "cli-direct",
-            "delete_namespace",
-            Some(namespace),
-            None,
-            "success",
-        );
+        let namespace = namespace.to_owned();
+
+        let count = self.vault.delete_namespace(&namespace).await?;
+        let _ = self
+            .audit
+            .record_async(
+                "cli-direct",
+                "delete_namespace",
+                Some(&namespace),
+                None,
+                "success",
+            )
+            .await;
         Ok(count)
     }
 
     pub async fn export_namespace(&self, namespace: &str) -> Result<HashMap<String, String>> {
-        let secrets = self.vault.export_namespace(namespace);
-        let _ = self.audit.record(
-            "cli-direct",
-            "export_namespace",
-            Some(namespace),
-            None,
-            "success",
-        );
+        let namespace = namespace.to_owned();
+
+        let secrets = self.vault.try_export_namespace(&namespace).await?;
+        let _ = self
+            .audit
+            .record_async(
+                "cli-direct",
+                "export_namespace",
+                Some(&namespace),
+                None,
+                "success",
+            )
+            .await;
         Ok(secrets)
     }
 
@@ -185,17 +249,28 @@ impl DirectClient {
         namespace: &str,
         only: Option<Vec<String>>,
     ) -> Result<HashMap<String, String>> {
-        let mut all = self.vault.export_namespace(namespace);
+        let namespace = namespace.to_owned();
+
+        let mut all = self.vault.try_export_namespace(&namespace).await?;
         if let Some(keys) = only {
-            all.retain(|k, _| keys.contains(k));
+            if keys.is_empty() {
+                anyhow::bail!("Select at least one key");
+            }
+            if keys.iter().any(|key| !all.contains_key(key)) {
+                anyhow::bail!("A requested secret is missing or expired");
+            }
+            all.retain(|key, _| keys.contains(key));
         }
-        let _ = self.audit.record(
-            "cli-direct",
-            "inject_secrets",
-            Some(namespace),
-            None,
-            "success",
-        );
+        let _ = self
+            .audit
+            .record_async(
+                "cli-direct",
+                "inject_secrets",
+                Some(&namespace),
+                None,
+                "success",
+            )
+            .await;
         Ok(all)
     }
 
@@ -205,25 +280,37 @@ impl DirectClient {
         key: &str,
         ttl_seconds: u64,
     ) -> Result<SecretMetadata> {
-        let meta = self.vault.renew(namespace, key, ttl_seconds)?;
-        let _ = self.audit.record(
-            "cli-direct",
-            "renew_secret",
-            Some(namespace),
-            Some(key),
-            "success",
-        );
+        let namespace = namespace.to_owned();
+        let key = key.to_owned();
+
+        let meta = self.vault.renew(&namespace, &key, ttl_seconds).await?;
+        let _ = self
+            .audit
+            .record_async(
+                "cli-direct",
+                "renew_secret",
+                Some(&namespace),
+                Some(&key),
+                "success",
+            )
+            .await;
         Ok(meta)
     }
 
     pub async fn audit_events(&self, limit: usize) -> Result<Vec<AuditEvent>> {
-        let events = self.audit.recent(limit);
-        Ok(events)
+        self.blocking(move |client| {
+            let events = client.audit.recent(limit);
+            Ok(events)
+        })
+        .await
     }
 
     pub async fn list_client_tokens(&self) -> Result<Vec<TokenMetadata>> {
-        let store = ClientTokenStore::load_or_create(self.config.client_tokens_path.clone())?;
-        Ok(store.list().iter().map(|t| t.metadata()).collect())
+        self.blocking(move |client| {
+            let store = ClientTokenStore::load_or_create(client.config.client_tokens_path.clone())?;
+            Ok(store.list().iter().map(|t| t.metadata()).collect())
+        })
+        .await
     }
 
     pub async fn create_client_token_with_policy(
@@ -235,58 +322,76 @@ impl DirectClient {
         permissions: Vec<Permission>,
         keys: Vec<String>,
     ) -> Result<ClientToken> {
-        let mut store = ClientTokenStore::load_or_create(self.config.client_tokens_path.clone())?;
-        let token = store.add_with_policy(
-            name,
-            description,
-            ttl_seconds,
-            namespaces,
-            permissions,
-            keys,
-        )?;
-        let _ = self.audit.record(
-            "cli-direct",
-            "create_client_token",
-            None,
-            Some(name),
-            "success",
-        );
-        Ok(token)
+        let name = name.to_owned();
+        self.blocking(move |client| {
+            let mut store =
+                ClientTokenStore::load_or_create(client.config.client_tokens_path.clone())?;
+            let token = store.add_with_policy(
+                &name,
+                description,
+                ttl_seconds,
+                namespaces,
+                permissions,
+                keys,
+            )?;
+            let _ = client.audit.record(
+                "cli-direct",
+                "create_client_token",
+                None,
+                Some(&name),
+                "success",
+            );
+            Ok(token)
+        })
+        .await
     }
 
     pub async fn revoke_client_token(&self, name: &str) -> Result<bool> {
-        let mut store = ClientTokenStore::load_or_create(self.config.client_tokens_path.clone())?;
-        let revoked = store.revoke(name)?;
-        let outcome = if revoked { "success" } else { "not_found" };
-        let _ = self.audit.record(
-            "cli-direct",
-            "revoke_client_token",
-            None,
-            Some(name),
-            outcome,
-        );
-        Ok(revoked)
+        let name = name.to_owned();
+        self.blocking(move |client| {
+            let mut store =
+                ClientTokenStore::load_or_create(client.config.client_tokens_path.clone())?;
+            let revoked = store.revoke(&name)?;
+            let outcome = if revoked { "success" } else { "not_found" };
+            let _ = client.audit.record(
+                "cli-direct",
+                "revoke_client_token",
+                None,
+                Some(&name),
+                outcome,
+            );
+            Ok(revoked)
+        })
+        .await
     }
 
     pub async fn renew_client_token(&self, name: &str, seconds: u64) -> Result<TokenMetadata> {
-        let mut store = ClientTokenStore::load_or_create(self.config.client_tokens_path.clone())?;
-        let meta = store.renew(name, seconds)?;
-        let _ = self.audit.record(
-            "cli-direct",
-            "renew_client_token",
-            None,
-            Some(name),
-            "success",
-        );
-        Ok(meta)
+        let name = name.to_owned();
+        self.blocking(move |client| {
+            let mut store =
+                ClientTokenStore::load_or_create(client.config.client_tokens_path.clone())?;
+            let meta = store.renew(&name, seconds)?;
+            let _ = client.audit.record(
+                "cli-direct",
+                "renew_client_token",
+                None,
+                Some(&name),
+                "success",
+            );
+            Ok(meta)
+        })
+        .await
     }
 
     pub async fn rotate_master_token(&self) -> Result<String> {
-        let token = self.config.rotate_auth_token()?;
-        let _ = self
-            .audit
-            .record("cli-direct", "rotate_master_token", None, None, "success");
-        Ok(token)
+        self.blocking(move |client| {
+            let token = client.config.rotate_auth_token()?;
+            let _ = client
+                .audit
+                .record("cli-direct", "rotate_master_token", None, None, "success");
+            Ok(token)
+        })
+        .await
     }
 
     pub async fn mcp_request(&self, request: serde_json::Value) -> Result<serde_json::Value> {

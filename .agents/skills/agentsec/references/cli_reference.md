@@ -1,4 +1,4 @@
-# agentsec 0.2 CLI reference
+# agentsec 0.3 CLI reference
 
 Global: `-c/--config-dir`, `--host`, `-p/--port`, `--url`, `--token`, `-D/--daemonless`, `--require-daemon`.
 Environment overrides: AGENTSEC_CONFIG_DIR, AGENTSEC_HOST, AGENTSEC_PORT,
@@ -8,6 +8,7 @@ Use injected AGENTSEC_TOKEN rather than putting bearer values in arguments.
 | Command | Options / behavior |
 | --- | --- |
 | `daemon` | `--ephemeral` keeps secret values and audit events in RAM; configuration/auth files still exist |
+| `migrate` | Offline conversion to encrypted namespace files; preserve the encrypted legacy backup; stop older clients first |
 | `status` | Reports ONLINE (daemon) or DAEMONLESS (direct vault), version, storage metrics |
 | `set KEY` | Stdin/hidden input; `-n`, `-d`, repeatable `-t`, `--ttl 1..31536000` |
 | `get KEY` | Masked inspection; `-n`; `--raw` is for privately captured process consumption only |
@@ -67,3 +68,7 @@ exists for trusted interactive workflows only, never automatic agent logging.
 
 Setup overwrites only bundled files, backs up changes as `*.previous`, and preserves
 unrelated custom resources. Review custom instructions in backups before removing them.
+
+Process startup runs on a short-lived worker; process waits and both output streams
+are async. Running children retain neither vault locks nor storage workers. CLI,
+HTTP and MCP share the same namespace-scoped storage implementation.

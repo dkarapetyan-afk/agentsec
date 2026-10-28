@@ -1,6 +1,6 @@
 [package]
 name = "agentsec"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 description = "A local daemon and CLI that securely manages namespaced secrets for coding agents"
 license = "MIT OR Apache-2.0"
@@ -40,4 +40,5 @@ anyhow = "1.0"
 thiserror = "2.0"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
+blake2 = "0.11"
 libc = "0.2"

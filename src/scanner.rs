@@ -28,14 +28,18 @@ pub async fn scan_workspace(
         return Ok(0);
     }
 
-    // Filter out very short secrets to avoid false positives (minimum 6 chars)
-    let check_secrets: Vec<(&String, &String)> = secrets
-        .iter()
-        .filter(|(_k, v)| v.trim().len() >= 6)
-        .collect();
-
-    let mut leak_count = 0;
-    scan_dir_recursive(&dir, &check_secrets, &mut leak_count)?;
+    let leak_count = tokio::task::spawn_blocking(move || {
+        // Filesystem traversal is independent of the async request executor.
+        let check_secrets: Vec<(&String, &String)> = secrets
+            .iter()
+            .filter(|(_, value)| value.trim().len() >= 6)
+            .collect();
+        let mut count = 0;
+        scan_dir_recursive(&dir, &check_secrets, &mut count)?;
+        anyhow::Ok(count)
+    })
+    .await
+    .context("Workspace scan worker failed")??;
 
     if leak_count == 0 {
         println!("✅ Clean! No stored secrets detected in workspace files.");

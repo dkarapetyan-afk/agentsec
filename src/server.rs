@@ -208,7 +208,8 @@ async fn authorize(
     let Some(principal) = principal else {
         state
             .audit
-            .record("unauthenticated", operation, namespace, key, "denied")
+            .record_async("unauthenticated", operation, namespace, key, "denied")
+            .await
             .map_err(|_| {
                 api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -223,7 +224,8 @@ async fn authorize(
     if permission.is_some_and(|p| !principal.allows(p, namespace, key)) {
         state
             .audit
-            .record(&principal.name, operation, namespace, key, "denied")
+            .record_async(&principal.name, operation, namespace, key, "denied")
+            .await
             .map_err(|_| {
                 api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -237,7 +239,8 @@ async fn authorize(
     }
     state
         .audit
-        .record(&principal.name, operation, namespace, key, "allowed")
+        .record_async(&principal.name, operation, namespace, key, "allowed")
+        .await
         .map_err(|_| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -267,6 +270,39 @@ fn record_result(
     {
         error!("Failed to persist operation audit result");
     }
+}
+
+async fn record_result_async(
+    state: &ServerState,
+    principal: &Principal,
+    operation: &str,
+    ns: Option<&str>,
+    key: Option<&str>,
+    success: bool,
+) {
+    if state
+        .audit
+        .record_async(
+            &principal.name,
+            operation,
+            ns,
+            key,
+            if success { "succeeded" } else { "failed" },
+        )
+        .await
+        .is_err()
+    {
+        error!("Failed to persist operation audit result");
+    }
+}
+
+// Keep file locks, encryption, disk access and audit writes off Tokio's I/O workers.
+async fn blocking<T: Send + 'static>(
+    operation: impl FnOnce() -> ApiResult<T> + Send + 'static,
+) -> ApiResult<T> {
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Storage worker failed"))?
 }
 
 pub fn create_router(state: ServerState) -> Router {
@@ -337,26 +373,32 @@ async fn status_handler(
     headers: HeaderMap,
 ) -> ApiResult<Json<StatusResponse>> {
     let principal = authorize(&state, &headers, "status", None, None, None).await?;
-    let mut stats = state.vault.stats();
+
+    let mut stats = state
+        .vault
+        .try_stats()
+        .await
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Vault read failed"))?;
     if principal.token.is_some() {
         let namespaces = state
             .vault
             .list_namespaces()
+            .await
             .into_iter()
             .filter(|ns| principal.namespace_visible(ns))
             .collect::<Vec<_>>();
         stats.namespaces_count = namespaces.len();
-        stats.active_secrets_count = namespaces
-            .iter()
-            .map(|ns| {
-                state
-                    .vault
-                    .list_secrets(ns)
-                    .iter()
-                    .filter(|s| principal.key_visible(&s.name))
-                    .count()
-            })
-            .sum();
+        stats.active_secrets_count = 0;
+        for ns in &namespaces {
+            stats.active_secrets_count += state
+                .vault
+                .try_list_secrets(ns)
+                .await
+                .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Vault read failed"))?
+                .iter()
+                .filter(|entry| principal.key_visible(&entry.name))
+                .count();
+        }
         stats.vault_path = None;
     }
     Ok(Json(StatusResponse {
@@ -383,9 +425,11 @@ async fn list_namespaces_handler(
         None,
     )
     .await?;
+
     let namespaces = state
         .vault
         .list_namespaces()
+        .await
         .into_iter()
         .filter(|ns| principal.namespace_visible(ns))
         .collect();
@@ -405,16 +449,18 @@ async fn delete_namespace_handler(
         None,
     )
     .await?;
+
     if principal.token.as_ref().is_some_and(|t| !t.keys.is_empty()) {
         state
             .audit
-            .record(
+            .record_async(
                 &principal.name,
                 "delete_namespace",
                 Some(&ns),
                 None,
                 "denied",
             )
+            .await
             .map_err(|_| {
                 api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -426,15 +472,16 @@ async fn delete_namespace_handler(
             "Key-restricted tokens cannot delete namespaces",
         ));
     }
-    let result = state.vault.delete_namespace(&ns);
-    record_result(
+    let result = state.vault.delete_namespace(&ns).await;
+    record_result_async(
         &state,
         &principal,
         "delete_namespace",
         Some(&ns),
         None,
         result.is_ok(),
-    );
+    )
+    .await;
     Ok(Json(DeleteNamespaceResponse {
         namespace: ns,
         deleted_count: result
@@ -455,9 +502,12 @@ async fn list_secrets_handler(
         None,
     )
     .await?;
+
     let secrets = state
         .vault
-        .list_secrets(&ns)
+        .try_list_secrets(&ns)
+        .await
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Vault read failed"))?
         .into_iter()
         .filter(|s| principal.key_visible(&s.name))
         .collect::<Vec<_>>();
@@ -481,15 +531,21 @@ async fn get_secret_handler(
         Some(&key),
     )
     .await?;
-    let entry = state.vault.get(&ns, &key);
-    record_result(
+
+    let entry = state
+        .vault
+        .try_get(&ns, &key)
+        .await
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Vault read failed"))?;
+    record_result_async(
         &state,
         &principal,
         "get_secret",
         Some(&ns),
         Some(&key),
         entry.is_some(),
-    );
+    )
+    .await;
     let entry =
         entry.ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Secret not found or expired"))?;
     Ok(Json(SecretDetailResponse {
@@ -514,6 +570,7 @@ async fn set_secret_handler(
         Some(&key),
     )
     .await?;
+
     if payload.value.trim().is_empty() {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -524,22 +581,26 @@ async fn set_secret_handler(
         crate::lease::expires_after(ttl)
             .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?;
     }
-    let result = state.vault.set(
-        &ns,
-        &key,
-        &payload.value,
-        payload.description,
-        payload.tags,
-        payload.ttl_seconds,
-    );
-    record_result(
+    let result = state
+        .vault
+        .set(
+            &ns,
+            &key,
+            &payload.value,
+            payload.description,
+            payload.tags,
+            payload.ttl_seconds,
+        )
+        .await;
+    record_result_async(
         &state,
         &principal,
         "set_secret",
         Some(&ns),
         Some(&key),
         result.is_ok(),
-    );
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
         Json(
@@ -562,15 +623,17 @@ async fn delete_secret_handler(
         Some(&key),
     )
     .await?;
-    let result = state.vault.delete(&ns, &key);
-    record_result(
+
+    let result = state.vault.delete(&ns, &key).await;
+    record_result_async(
         &state,
         &principal,
         "delete_secret",
         Some(&ns),
         Some(&key),
         result.is_ok(),
-    );
+    )
+    .await;
     Ok(Json(DeleteSecretResponse {
         deleted: result
             .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Vault update failed"))?,
@@ -593,15 +656,17 @@ async fn renew_secret_handler(
         Some(&key),
     )
     .await?;
-    let result = state.vault.renew(&ns, &key, request.ttl_seconds);
-    record_result(
+
+    let result = state.vault.renew(&ns, &key, request.ttl_seconds).await;
+    record_result_async(
         &state,
         &principal,
         "renew_secret",
         Some(&ns),
         Some(&key),
         result.is_ok(),
-    );
+    )
+    .await;
     Ok(Json(result.map_err(|e| {
         api_error(StatusCode::BAD_REQUEST, e.to_string())
     })?))
@@ -620,7 +685,12 @@ async fn export_namespace_handler(
         None,
     )
     .await?;
-    let mut secrets = state.vault.export_namespace(&ns);
+
+    let mut secrets = state
+        .vault
+        .try_export_namespace(&ns)
+        .await
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Vault read failed"))?;
     secrets.retain(|key, _| principal.key_visible(key));
     Ok(Json(ExportNamespaceResponse {
         namespace: ns,
@@ -642,6 +712,7 @@ async fn inject_handler(
         None,
     )
     .await?;
+
     if let Some(keys) = &request.keys {
         if keys.is_empty() {
             return Err(api_error(
@@ -653,7 +724,8 @@ async fn inject_handler(
             if !principal.key_visible(key) {
                 state
                     .audit
-                    .record(&principal.name, "run", Some(&ns), Some(key), "denied")
+                    .record_async(&principal.name, "run", Some(&ns), Some(key), "denied")
+                    .await
                     .map_err(|_| {
                         api_error(
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -667,7 +739,11 @@ async fn inject_handler(
             }
         }
     }
-    let mut secrets = state.vault.export_namespace(&ns);
+    let mut secrets = state
+        .vault
+        .try_export_namespace(&ns)
+        .await
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Vault read failed"))?;
     secrets.retain(|key, _| {
         principal.key_visible(key) && request.keys.as_ref().is_none_or(|keys| keys.contains(key))
     });
@@ -676,14 +752,14 @@ async fn inject_handler(
         .as_ref()
         .is_some_and(|keys| keys.iter().any(|key| !secrets.contains_key(key)))
     {
-        record_result(&state, &principal, "run", Some(&ns), None, false);
+        record_result_async(&state, &principal, "run", Some(&ns), None, false).await;
         return Err(api_error(
             StatusCode::NOT_FOUND,
             "A requested secret is missing or expired",
         ));
     }
     for key in secrets.keys() {
-        record_result(&state, &principal, "inject", Some(&ns), Some(key), true);
+        record_result_async(&state, &principal, "inject", Some(&ns), Some(key), true).await;
     }
     Ok(Json(ExportNamespaceResponse {
         namespace: ns,
@@ -703,16 +779,13 @@ async fn list_tokens_handler(
         None,
     )
     .await?;
-    Ok(Json(TokenListResponse {
-        tokens: state
-            .client_tokens
-            .read()
-            .await
-            .list()
-            .iter()
-            .map(ClientToken::metadata)
-            .collect(),
-    }))
+    let tokens = state.client_tokens.clone().read_owned().await;
+    blocking(move || {
+        Ok(Json(TokenListResponse {
+            tokens: tokens.list().iter().map(ClientToken::metadata).collect(),
+        }))
+    })
+    .await
 }
 async fn create_token_handler(
     State(state): State<Arc<ServerState>>,
@@ -728,26 +801,30 @@ async fn create_token_handler(
         None,
     )
     .await?;
-    let result = state.client_tokens.write().await.add_with_policy(
-        &payload.name,
-        payload.description,
-        payload.ttl_seconds,
-        payload.namespaces,
-        payload.permissions,
-        payload.keys,
-    );
-    record_result(
-        &state,
-        &principal,
-        "create_token",
-        None,
-        Some(&payload.name),
-        result.is_ok(),
-    );
-    Ok((
-        StatusCode::CREATED,
-        Json(result.map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?),
-    ))
+    let mut tokens = state.client_tokens.clone().write_owned().await;
+    blocking(move || {
+        let result = tokens.add_with_policy(
+            &payload.name,
+            payload.description,
+            payload.ttl_seconds,
+            payload.namespaces,
+            payload.permissions,
+            payload.keys,
+        );
+        record_result(
+            &state,
+            &principal,
+            "create_token",
+            None,
+            Some(&payload.name),
+            result.is_ok(),
+        );
+        Ok((
+            StatusCode::CREATED,
+            Json(result.map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?),
+        ))
+    })
+    .await
 }
 async fn revoke_token_handler(
     State(state): State<Arc<ServerState>>,
@@ -763,20 +840,24 @@ async fn revoke_token_handler(
         None,
     )
     .await?;
-    let result = state.client_tokens.write().await.revoke(&name);
-    record_result(
-        &state,
-        &principal,
-        "revoke_token",
-        None,
-        Some(&name),
-        result.is_ok(),
-    );
-    Ok(Json(RevokeTokenResponse {
-        name,
-        revoked: result
-            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Token update failed"))?,
-    }))
+    let mut tokens = state.client_tokens.clone().write_owned().await;
+    blocking(move || {
+        let result = tokens.revoke(&name);
+        record_result(
+            &state,
+            &principal,
+            "revoke_token",
+            None,
+            Some(&name),
+            result.is_ok(),
+        );
+        Ok(Json(RevokeTokenResponse {
+            name,
+            revoked: result
+                .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Token update failed"))?,
+        }))
+    })
+    .await
 }
 async fn renew_token_handler(
     State(state): State<Arc<ServerState>>,
@@ -793,22 +874,22 @@ async fn renew_token_handler(
         None,
     )
     .await?;
-    let result = state
-        .client_tokens
-        .write()
-        .await
-        .renew(&name, request.ttl_seconds);
-    record_result(
-        &state,
-        &principal,
-        "renew_token",
-        None,
-        Some(&name),
-        result.is_ok(),
-    );
-    Ok(Json(result.map_err(|e| {
-        api_error(StatusCode::BAD_REQUEST, e.to_string())
-    })?))
+    let mut tokens = state.client_tokens.clone().write_owned().await;
+    blocking(move || {
+        let result = tokens.renew(&name, request.ttl_seconds);
+        record_result(
+            &state,
+            &principal,
+            "renew_token",
+            None,
+            Some(&name),
+            result.is_ok(),
+        );
+        Ok(Json(result.map_err(|e| {
+            api_error(StatusCode::BAD_REQUEST, e.to_string())
+        })?))
+    })
+    .await
 }
 async fn rotate_token_handler(
     State(state): State<Arc<ServerState>>,
@@ -823,25 +904,28 @@ async fn rotate_token_handler(
         None,
     )
     .await?;
-    if state.config.custom_token.is_some() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Externally supplied master tokens must be rotated by their issuer",
-        ));
-    }
-    let mut current = state.auth_token.write().await;
-    let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
-    let token = hex::encode(bytes);
-    state.config.save_auth_token(&token).map_err(|_| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Could not persist rotated token",
-        )
-    })?;
-    *current = token.clone();
-    record_result(&state, &principal, "rotate_master", None, None, true);
-    Ok(Json(RotateTokenResponse { token }))
+    let mut current = state.auth_token.clone().write_owned().await;
+    blocking(move || {
+        if state.config.custom_token.is_some() {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "Externally supplied master tokens must be rotated by their issuer",
+            ));
+        }
+        let mut bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        let token = hex::encode(bytes);
+        state.config.save_auth_token(&token).map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not persist rotated token",
+            )
+        })?;
+        *current = token.clone();
+        record_result(&state, &principal, "rotate_master", None, None, true);
+        Ok(Json(RotateTokenResponse { token }))
+    })
+    .await
 }
 async fn audit_handler(
     State(state): State<Arc<ServerState>>,
@@ -857,9 +941,12 @@ async fn audit_handler(
         None,
     )
     .await?;
-    Ok(Json(AuditResponse {
-        events: state.audit.recent(query.limit.unwrap_or(50)),
-    }))
+    blocking(move || {
+        Ok(Json(AuditResponse {
+            events: state.audit.recent(query.limit.unwrap_or(50)),
+        }))
+    })
+    .await
 }
 async fn mcp_get_handler(
     State(state): State<Arc<ServerState>>,
@@ -941,11 +1028,13 @@ pub async fn start_server(mut config: AppConfig, vault: Vault, auth_token: Strin
         .ok()
         .filter(|s| !s.trim().is_empty());
     let client_tokens = Arc::new(RwLock::new(config.load_client_tokens()?));
-    let audit = AuditLog::new(if vault.stats().is_ephemeral {
-        None
-    } else {
-        Some(config.data_dir.join("audit.jsonl"))
-    });
+    let is_ephemeral = vault.try_stats().await?.is_ephemeral;
+    let audit_path = config.data_dir.join("audit.jsonl");
+    let audit = tokio::task::spawn_blocking(move || {
+        AuditLog::new(if is_ephemeral { None } else { Some(audit_path) })
+    })
+    .await
+    .context("Daemon storage worker failed")?;
     let state = ServerState {
         vault: vault.clone(),
         auth_token: Arc::new(RwLock::new(auth_token)),
@@ -955,23 +1044,37 @@ pub async fn start_server(mut config: AppConfig, vault: Vault, auth_token: Strin
         config: config.clone(),
         started_at,
     };
+    let shutdown_vault = vault.clone();
     let cleanup = CleanupTask(tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            match vault.purge_expired() {
+            match vault.purge_expired().await {
                 Ok(count) if count > 0 => {
-                    let _ = audit.record("daemon", "expire_secrets", None, None, "succeeded");
+                    if audit
+                        .record_async("daemon", "expire_secrets", None, None, "succeeded")
+                        .await
+                        .is_err()
+                    {
+                        error!("Expired-secret audit failed");
+                    }
                 }
                 Err(_) => error!("Expired-secret cleanup failed"),
                 _ => {}
             }
-            let mut tokens = client_tokens.write().await;
-            if tokens.clean_expired() > 0 {
-                if tokens.save().is_err() {
-                    error!("Expired-token cleanup failed");
+            let mut tokens = client_tokens.clone().write_owned().await;
+            let cleanup_audit = audit.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                if tokens.clean_expired() > 0 {
+                    tokens.save()?;
+                    cleanup_audit.record("daemon", "expire_tokens", None, None, "succeeded")?;
                 }
-                let _ = audit.record("daemon", "expire_tokens", None, None, "succeeded");
+                anyhow::Ok(())
+            })
+            .await;
+            if !matches!(result, Ok(Ok(()))) {
+                error!("Expired-token cleanup failed");
             }
         }
     }));
@@ -1005,6 +1108,7 @@ pub async fn start_server(mut config: AppConfig, vault: Vault, auth_token: Strin
         .with_graceful_shutdown(shutdown)
         .await;
     drop(cleanup);
+    shutdown_vault.wait_for_pending().await;
     config.remove_daemon_info();
     result.context("Daemon server failed")
 }

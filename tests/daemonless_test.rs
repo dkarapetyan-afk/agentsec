@@ -15,7 +15,9 @@ async fn test_direct_client_crud_and_disk_persistence() {
     fs::create_dir_all(&temp_dir).unwrap();
 
     let config = AppConfig::load(Some(temp_dir.clone()), Some(59999)).unwrap();
-    let client = DirectClient::new(&config).expect("Failed to initialize DirectClient");
+    let client = DirectClient::new(&config)
+        .await
+        .expect("Failed to initialize DirectClient");
 
     let status = client.status().await.expect("Status failed");
     assert_eq!(status.stats.active_secrets_count, 0);
@@ -91,14 +93,14 @@ async fn test_direct_client_cross_process_disk_reload() {
     let config = AppConfig::load(Some(temp_dir.clone()), Some(59998)).unwrap();
 
     // Client 1 writes a secret to the vault file
-    let client1 = DirectClient::new(&config).unwrap();
+    let client1 = DirectClient::new(&config).await.unwrap();
     client1
         .set_secret("ws:shared", "KEY_FROM_C1", "val1", None, vec![], None)
         .await
         .unwrap();
 
     // Client 2 is created independently pointing to the same vault path
-    let client2 = DirectClient::new(&config).unwrap();
+    let client2 = DirectClient::new(&config).await.unwrap();
     let detail = client2
         .get_secret("ws:shared", "KEY_FROM_C1")
         .await
