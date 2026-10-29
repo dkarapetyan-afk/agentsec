@@ -11,7 +11,7 @@ metadata:
 
 # agentsec
 
-For agentsec 0.2.2 and later. Keep credentials and sensitive device paths in agentsec,
+For agentsec 0.3.0 and later. Keep credentials and sensitive device paths in agentsec,
 not workspace files, command arguments, logs, commits, chat, or dashboard records.
 Templates contain placeholders only. Report key names, namespaces, and masked previews.
 
@@ -20,8 +20,8 @@ Templates contain placeholders only. Report key names, namespaces, and masked pr
 `agentsec` operates in two modes with seamless auto-fallback:
 - **Automatic Fallback (Default)**: If the background daemon process is offline or unresponsive,
   CLI subcommands (`get`, `set`, `list`, `run`, `doctor`, `token`, `mcp`, etc.) automatically
-  operate directly on the local encrypted vault (`vault.enc`) using cross-process advisory locking
-  (`vault.lock`). A running daemon is NOT required for local operations or CLI/MCP execution.
+  operate directly on encrypted namespace files inside `vault.enc/`. Each namespace has
+  its own lock; waiting for one never occupies an executor or storage worker. A running daemon is NOT required for local operations or CLI/MCP execution.
 - **Explicit Daemonless Mode**: Pass `--daemonless` (`-D`) or set `AGENTSEC_DAEMONLESS=1` in your
   environment to skip daemon discovery and access the local vault directly.
 - **Strict Daemon Requirement**: Pass `--require-daemon` if an active daemon is mandatory (e.g.
@@ -42,6 +42,19 @@ Prefer connected agentsec MCP tools. Discover their actual schema before calling
 Otherwise resolve `agentsec` in PATH, then `/usr/local/bin/agentsec`, then
 `$HOME/.cargo/bin/agentsec`. Built-in MCP stdio (`agentsec mcp` or `agentsec -D mcp`)
 works in both daemon and daemonless modes. Do not start duplicate MCP servers.
+
+## Concurrency and upgrades
+
+There is no vault-wide lock. Namespace file locks use nonblocking acquisition and async
+retry. Child process waits and both output streams are async. Credentials are acquired
+and all vault locks released before process startup; a running child holds no storage
+worker. MCP stdio reserves separate capacity for 32 commands and 64 other operations;
+excess requests receive a busy error rather than blocking the reader.
+
+For a pre-0.3 vault, stop older agentsec processes and run `agentsec migrate` once.
+It converts the single encrypted file into an encrypted namespace directory, preserves
+`vault.legacy.enc`, and resumes interrupted imports. Older binaries cannot open the new
+format. Restart the daemon and MCP adapters with the upgraded binary and run doctor.
 
 ## Namespace and permissions
 
