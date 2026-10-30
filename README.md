@@ -72,7 +72,7 @@ agentsec status
 ```text
 Daemon Status:    ONLINE
 Process ID:       12345
-Version:          0.3.0
+Version:          0.4.0
 Endpoint:         http://127.0.0.1:52199
 Uptime:           42s
 Namespaces:       2
